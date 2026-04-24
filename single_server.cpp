@@ -8,8 +8,8 @@
 #include <vector>
 
 #define PORT 8080
-#define WIDTH 20
-#define HEIGHT 10
+#define WIDTH 100
+#define HEIGHT 50
 
 struct Player
 {
