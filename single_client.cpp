@@ -303,6 +303,8 @@ int main()
 
     connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
 
+    send(sock, "CLIENT\n", 7, 0);
+
     std::string buffer = "";
     std::unordered_map<char, PlayerRenderState> playerStates;
     std::vector<std::vector<std::string>> frozenTrailRunes;
@@ -322,7 +324,7 @@ int main()
 
     while (true)
     {
-        int valread = recv(sock, recv_buffer, 1024, 0);
+        int valread = recv(sock, recv_buffer, sizeof(recv_buffer), 0);
 
         if (valread > 0)
         {
