@@ -6,106 +6,224 @@
 #include <chrono>
 #include <cstring>
 #include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <atomic>
+#include <random>
 
 #define PORT 8080
 #define WIDTH 100
 #define HEIGHT 50
 
+std::mt19937 rng{std::random_device{}()};
+std::uniform_int_distribution<int> distX(1, WIDTH - 2);
+std::uniform_int_distribution<int> distY(1, HEIGHT - 2);
+
 struct Player
 {
-    int x = WIDTH / 2;
-    int y = HEIGHT / 2;
-    std::string dir = "RIGHT";
+    int id;
+    int x;
+    int y;
+    std::string dir;
+    int socket;
+    bool alive;
+    char symbol;
 };
 
 class TronGame
 {
 private:
-    std::vector<std::vector<char>> grid;  // '#' = wall/trail, '.' = empty, 'A' = player
-    Player player;
+    std::vector<std::vector<char>> grid;
+    std::unordered_map<int, Player> players; // key = socket
+    std::mutex mtx;
+    std::atomic<int> nextId{1};
 
 public:
     TronGame()
     {
         grid.resize(HEIGHT, std::vector<char>(WIDTH, '.'));
-        
-        // Optional: add some border walls (makes it more "arena" like)
-        for (int x = 0; x < WIDTH; x++) {
+
+        // borders
+        for (int x = 0; x < WIDTH; x++)
+        {
             grid[0][x] = '#';
-            grid[HEIGHT-1][x] = '#';
+            grid[HEIGHT - 1][x] = '#';
         }
-        for (int y = 0; y < HEIGHT; y++) {
+        for (int y = 0; y < HEIGHT; y++)
+        {
             grid[y][0] = '#';
-            grid[y][WIDTH-1] = '#';
+            grid[y][WIDTH - 1] = '#';
+        }
+    }
+
+    void addPlayer(int socket)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        
+
+        Player p;
+        p.id = nextId++;
+        p.socket = socket;
+        p.x = distX(rng);
+        p.y = distY(rng);
+        p.dir = "RIGHT";
+        p.alive = true;
+        p.symbol = 'A' + (p.id % 26);
+
+        players[socket] = p;
+        grid[p.y][p.x] = p.symbol;
+
+        std::cout << "Player " << p.id << " joined\n";
+    }
+
+    void removePlayer(int socket)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        if (players.count(socket))
+        {
+            auto &p = players[socket];
+            grid[p.y][p.x] = '#';
+            players.erase(socket);
         }
 
-        // Place player in the middle (clear the border if needed)
-        player.x = WIDTH / 2;
-        player.y = HEIGHT / 2;
-        grid[player.y][player.x] = 'A';
+        close(socket);
     }
 
-    bool move()
+    void changeDirection(int socket, const std::string &dir)
     {
-        // Clear current player position (will be replaced by trail)
-        grid[player.y][player.x] = '#';   // Leave trail behind
+        std::lock_guard<std::mutex> lock(mtx);
 
-        // Move player
-        if (player.dir == "UP")    player.y--;
-        else if (player.dir == "DOWN")  player.y++;
-        else if (player.dir == "LEFT")  player.x--;
-        else if (player.dir == "RIGHT") player.x++;
+        if (!players.count(socket)) return;
 
-        // Check wall collision (including borders)
-        if (player.x < 0 || player.x >= WIDTH || player.y < 0 || player.y >= HEIGHT)
-            return false;
+        Player &p = players[socket];
 
-        // Check trail collision
-        if (grid[player.y][player.x] == '#')
-            return false;
-
-        // Place player at new position
-        grid[player.y][player.x] = 'A';
-
-        return true;  // move successful
-    }
-
-    void changeDirection(const std::string& newDir)
-    {
-        // Simple prevention of 180° turns (optional but feels better)
-        if ((newDir == "UP" && player.dir == "DOWN") ||
-            (newDir == "DOWN" && player.dir == "UP") ||
-            (newDir == "LEFT" && player.dir == "RIGHT") ||
-            (newDir == "RIGHT" && player.dir == "LEFT"))
+        if ((dir == "UP" && p.dir == "DOWN") ||
+            (dir == "DOWN" && p.dir == "UP") ||
+            (dir == "LEFT" && p.dir == "RIGHT") ||
+            (dir == "RIGHT" && p.dir == "LEFT"))
             return;
 
-        player.dir = newDir;
+        p.dir = dir;
     }
 
-    std::string buildGrid() const
+    void moveAll()
     {
-        std::string output;
+        std::lock_guard<std::mutex> lock(mtx);
+
+        for (auto &pair : players)
+        {
+            Player &p = pair.second;
+            if (!p.alive) continue;
+
+            // leave trail
+            grid[p.y][p.x] = '#';
+
+            // move
+            if (p.dir == "UP") p.y--;
+            else if (p.dir == "DOWN") p.y++;
+            else if (p.dir == "LEFT") p.x--;
+            else if (p.dir == "RIGHT") p.x++;
+
+            // collision
+            if (p.x < 0 || p.x >= WIDTH || p.y < 0 || p.y >= HEIGHT ||
+                grid[p.y][p.x] == '#')
+            {
+                p.alive = false;
+                continue;
+            }
+
+            grid[p.y][p.x] = p.symbol;
+        }
+    }
+
+    std::string buildGrid()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        std::string out;
         for (int y = 0; y < HEIGHT; y++)
         {
             for (int x = 0; x < WIDTH; x++)
-            {
-                output += grid[y][x];
-            }
-            output += '\n';
+                out += grid[y][x];
+            out += '\n';
         }
-        output += "END\n";  // delimiter for client
-        return output;
+
+        out += "END\n";
+        return out;
     }
 
-    std::string getGameOverMessage() const
+    std::vector<int> getSockets()
     {
-        return "GAME OVER\nYou crashed into a wall or your own trail!\nEND\n";
+        std::lock_guard<std::mutex> lock(mtx);
+
+        std::vector<int> sockets;
+        for (auto &p : players)
+            sockets.push_back(p.first);
+
+        return sockets;
     }
 };
 
+// ---------------- SERVER THREADS ----------------
+
+void clientHandler(TronGame &game, int socket)
+{
+    char buffer[1024];
+
+    while (true)
+    {
+        int valread = recv(socket, buffer, sizeof(buffer), MSG_DONTWAIT);
+
+        if (valread > 0)
+        {
+            std::string input(buffer, valread);
+
+            if (input.find("UP") != std::string::npos)
+                game.changeDirection(socket, "UP");
+            else if (input.find("DOWN") != std::string::npos)
+                game.changeDirection(socket, "DOWN");
+            else if (input.find("LEFT") != std::string::npos)
+                game.changeDirection(socket, "LEFT");
+            else if (input.find("RIGHT") != std::string::npos)
+                game.changeDirection(socket, "RIGHT");
+        }
+
+        memset(buffer, 0, sizeof(buffer));
+
+        if (valread == 0)
+        {
+            game.removePlayer(socket);
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+}
+
+void gameLoop(TronGame &game)
+{
+    while (true)
+    {
+        game.moveAll();
+
+        std::string state = game.buildGrid();
+        auto sockets = game.getSockets();
+
+        for (int s : sockets)
+        {
+            send(s, state.c_str(), state.size(), 0);
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    }
+}
+
+// ---------------- MAIN ----------------
+
 int main()
 {
-    int server_fd, new_socket;
+    int server_fd;
     struct sockaddr_in address;
     int opt = 1;
     int addrlen = sizeof(address);
@@ -117,58 +235,39 @@ int main()
     address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0)
+    {
         perror("bind failed");
         return 1;
     }
-    if (listen(server_fd, 1) < 0) {
+
+    if (listen(server_fd, 10) < 0)
+    {
         perror("listen failed");
         return 1;
     }
 
-    std::cout << "Waiting for client on port " << PORT << "...\n";
-    new_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen);
-    std::cout << "Client connected!\n";
+    std::cout << "Server running on port " << PORT << "\n";
 
     TronGame game;
-    char buffer[1024] = {0};
+
+    // Start game loop
+    std::thread(gameLoop, std::ref(game)).detach();
 
     while (true)
     {
-        // Non-blocking receive for direction input
-        int valread = recv(new_socket, buffer, 1024, MSG_DONTWAIT);
-        if (valread > 0)
+        int client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen);
+
+        if (client_socket >= 0)
         {
-            std::string input(buffer, valread);
-            if (input.find("UP") != std::string::npos)
-                game.changeDirection("UP");
-            else if (input.find("DOWN") != std::string::npos)
-                game.changeDirection("DOWN");
-            else if (input.find("LEFT") != std::string::npos)
-                game.changeDirection("LEFT");
-            else if (input.find("RIGHT") != std::string::npos)
-                game.changeDirection("RIGHT");
+            std::cout << "Client connected\n";
+
+            game.addPlayer(client_socket);
+
+            std::thread(clientHandler, std::ref(game), client_socket).detach();
         }
-        memset(buffer, 0, sizeof(buffer));
-
-        // Try to move
-        if (!game.move())
-        {
-            // Game Over
-            std::string msg = game.getGameOverMessage();
-            send(new_socket, msg.c_str(), msg.size(), 0);
-            std::cout << "Game Over! Client disconnected.\n";
-            break;
-        }
-
-        // Send current grid state
-        std::string gridStr = game.buildGrid();
-        send(new_socket, gridStr.c_str(), gridStr.size(), 0);
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(150));  // Game speed
     }
 
-    close(new_socket);
     close(server_fd);
     return 0;
 }
