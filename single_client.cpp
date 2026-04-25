@@ -7,8 +7,13 @@
 #include <unordered_map>
 #include <vector>
 #include <cctype>
+#include <netdb.h>
+#include <cstdio>
+#include <cstdlib>
+#include <atomic>
+#include <sstream>
 
-#define PORT 8080
+#include "sunlab_config.h"
 
 const std::string playerUpRune = "\xE2\x87\xA1";
 const std::string playerLeftRune = "\xE2\x87\xA0";
@@ -287,38 +292,304 @@ std::string mapKey(char c)
         return "LEFT";
     if (c == 'd')
         return "RIGHT";
+    if (c == 'r' || c == 'R')
+        return "START";
     return "";
 }
 
-int main()
+struct ServerFrame
 {
-    int sock = 0;
-    struct sockaddr_in serv_addr;
+    std::string phase = "UNKNOWN";
+    std::string role = "PLAYER";
+    bool alive = true;
+    std::string winner = "NONE";
+    int timeRemaining = 0;
+    std::string playerSymbol = "NONE";
+    std::string status;
+    std::string grid;
+};
 
-    sock = socket(AF_INET, SOCK_STREAM, 0);
+void trimLineEnd(std::string &line)
+{
+    if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+}
 
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(PORT);
-    inet_pton(AF_INET, "127.0.0.1", &serv_addr.sin_addr);
+ServerFrame parseFrame(const std::string &rawFrame)
+{
+    ServerFrame frame;
+    std::istringstream stream(rawFrame);
+    std::string line;
 
-    connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr));
+    if (!std::getline(stream, line))
+        return frame;
+    trimLineEnd(line);
+
+    if (line != "META")
+    {
+        frame.grid = rawFrame;
+        return frame;
+    }
+
+    while (std::getline(stream, line))
+    {
+        trimLineEnd(line);
+        if (line == "GRID")
+            break;
+
+        size_t equals = line.find('=');
+        if (equals == std::string::npos)
+            continue;
+
+        std::string key = line.substr(0, equals);
+        std::string value = line.substr(equals + 1);
+
+        if (key == "phase")
+            frame.phase = value;
+        else if (key == "role")
+            frame.role = value;
+        else if (key == "alive")
+            frame.alive = value == "1";
+        else if (key == "winner")
+            frame.winner = value;
+        else if (key == "time_remaining")
+            frame.timeRemaining = std::atoi(value.c_str());
+        else if (key == "player_symbol")
+            frame.playerSymbol = value;
+        else if (key == "status")
+            frame.status = value;
+    }
+
+    std::ostringstream gridStream;
+    while (std::getline(stream, line))
+    {
+        trimLineEnd(line);
+        gridStream << line << '\n';
+    }
+
+    frame.grid = gridStream.str();
+    return frame;
+}
+
+void printStatusBar(const ServerFrame &frame)
+{
+    std::cout << "--------------------------------------------------------------------------------\n";
+    std::cout << "Role: " << frame.role << " | ";
+
+    if (frame.role == "PLAYER")
+        std::cout << (frame.alive ? "ALIVE" : "DEAD");
+    else
+        std::cout << "SPECTATING";
+
+    std::cout << " | Phase: " << frame.phase;
+
+    if (frame.phase == "COUNTDOWN" || frame.phase == "IN_PROGRESS")
+        std::cout << " | Time Remaining: " << frame.timeRemaining << "s";
+
+    if (frame.winner != "NONE")
+        std::cout << " | Winner: " << frame.winner;
+
+    std::cout << "\n";
+    if (!frame.status.empty())
+        std::cout << frame.status << "\n";
+
+    bool moveEnabled = frame.role == "PLAYER" && frame.alive && frame.phase == "IN_PROGRESS";
+    std::cout << "Controls: R=start";
+    if (moveEnabled)
+        std::cout << " | WASD=move";
+    else
+        std::cout << " | WASD=move (disabled)";
+    std::cout << "\n";
+}
+
+struct ClientStartupOptions
+{
+    std::string host;
+    int port = 0;
+    std::string name;
+};
+
+void printClientUsage(const char *programName)
+{
+    std::cout << "Usage: " << programName
+              << " [--host <sunlab-host>] [--port 6000-6010] [--name <player-name>]\n";
+}
+
+bool parseClientArgs(int argc, char *argv[], ClientStartupOptions &options)
+{
+    for (int i = 1; i < argc; i++)
+    {
+        std::string arg = argv[i];
+
+        if (arg == "--host")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "--host requires a value.\n";
+                return false;
+            }
+
+            std::string parsedHost = argv[++i];
+            if (!isValidSunlabHost(parsedHost))
+            {
+                std::cerr << "Invalid host '" << parsedHost
+                          << "'. Host must be one of the Sunlab nodes.\n";
+                return false;
+            }
+
+            options.host = normalizeSunlabHost(parsedHost);
+            continue;
+        }
+
+        if (arg == "--port")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "--port requires a value.\n";
+                return false;
+            }
+
+            int parsedPort = 0;
+            if (!parsePortInRange(argv[++i], parsedPort))
+            {
+                std::cerr << "Invalid port. Use an integer in [" << kMinAllowedPort
+                          << "," << kMaxAllowedPort << "].\n";
+                return false;
+            }
+
+            options.port = parsedPort;
+            continue;
+        }
+
+        if (arg == "--name")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "--name requires a value.\n";
+                return false;
+            }
+
+            std::string parsedName = sanitizePlayerName(argv[++i]);
+            if (parsedName.empty())
+            {
+                std::cerr << "Invalid --name value. Use letters, digits, spaces, '_' or '-'.\n";
+                return false;
+            }
+
+            options.name = parsedName;
+            continue;
+        }
+
+        if (arg == "--help" || arg == "-h")
+        {
+            printClientUsage(argv[0]);
+            std::exit(0);
+        }
+
+        std::cerr << "Unknown argument: " << arg << "\n";
+        return false;
+    }
+
+    return true;
+}
+
+int connectToHost(const std::string &host, int port)
+{
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo *results = nullptr;
+    std::string portText = std::to_string(port);
+    int rc = getaddrinfo(host.c_str(), portText.c_str(), &hints, &results);
+    if (rc != 0)
+    {
+        std::cerr << "getaddrinfo failed for " << host << ":" << port << " (" << gai_strerror(rc) << ")\n";
+        return -1;
+    }
+
+    int sock = -1;
+    for (addrinfo *candidate = results; candidate != nullptr; candidate = candidate->ai_next)
+    {
+        sock = socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
+        if (sock < 0)
+            continue;
+
+        if (connect(sock, candidate->ai_addr, candidate->ai_addrlen) == 0)
+            break;
+
+        close(sock);
+        sock = -1;
+    }
+
+    freeaddrinfo(results);
+    return sock;
+}
+
+int main(int argc, char *argv[])
+{
+    ClientStartupOptions options;
+    if (!parseClientArgs(argc, argv, options))
+    {
+        printClientUsage(argv[0]);
+        return 1;
+    }
+
+    if (options.host.empty())
+        options.host = promptForSunlabHost();
+    if (options.port == 0)
+        options.port = promptForPort();
+    if (options.name.empty())
+    {
+        const char *user = std::getenv("USER");
+        if (user == nullptr)
+            user = std::getenv("USERNAME");
+
+        if (user != nullptr)
+            options.name = sanitizePlayerName(user);
+        if (options.name.empty())
+            options.name = promptForPlayerName();
+    }
+
+    std::string fqdn = toSunlabFqdn(options.host);
+    int sock = connectToHost(fqdn, options.port);
+    if (sock < 0)
+    {
+        std::cerr << "Unable to connect to " << fqdn << ":" << options.port << "\n";
+        return 1;
+    }
+
+    std::cout << "Connected to " << fqdn << ":" << options.port << "\n";
 
     send(sock, "CLIENT\n", 7, 0);
+    std::string nameMessage = "NAME:" + options.name + "\n";
+    send(sock, nameMessage.c_str(), nameMessage.size(), 0);
 
     std::string buffer = "";
     std::unordered_map<char, PlayerRenderState> playerStates;
     std::vector<std::vector<std::string>> frozenTrailRunes;
+    std::atomic<bool> controlsEnabled{false};
 
     // input thread
     std::thread inputThread([&]()
                             {
         while (true) {
             char c = getch();
-            std::string dir = mapKey(c);
-            if (!dir.empty()) {
-                send(sock, dir.c_str(), dir.size(), 0);
+            std::string command = mapKey(c);
+            if (command.empty())
+                continue;
+
+            if (command == "START") {
+                send(sock, command.c_str(), command.size(), 0);
+                continue;
             }
+
+            if (!controlsEnabled.load())
+                continue;
+
+            send(sock, command.c_str(), command.size(), 0);
         } });
+    inputThread.detach();
 
     char recv_buffer[1024];
 
@@ -334,17 +605,32 @@ int main()
             size_t pos;
             while ((pos = buffer.find("END\n")) != std::string::npos)
             {
-                std::string grid = buffer.substr(0, pos);
+                std::string rawFrame = buffer.substr(0, pos);
                 buffer.erase(0, pos + 4);
 
-                std::string rendered = renderGrid(grid, playerStates, frozenTrailRunes);
-                system("clear");
+                ServerFrame frame = parseFrame(rawFrame);
+                controlsEnabled.store(frame.role == "PLAYER" &&
+                                      frame.alive &&
+                                      frame.phase == "IN_PROGRESS");
+
+                std::string rendered = renderGrid(frame.grid, playerStates, frozenTrailRunes);
+                std::system("clear");
                 std::cout << rendered << std::flush;
+                printStatusBar(frame);
             }
+        }
+        else if (valread == 0)
+        {
+            std::cout << "Disconnected from server.\n";
+            break;
+        }
+        else
+        {
+            std::perror("recv");
+            break;
         }
     }
 
-    inputThread.join();
     close(sock);
     return 0;
 }
