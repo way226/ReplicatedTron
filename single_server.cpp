@@ -1,6 +1,7 @@
 #include <iostream>
 #include <unistd.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 #include <string>
 #include <thread>
 #include <chrono>
@@ -15,10 +16,33 @@
 #define WIDTH 100
 #define HEIGHT 50
 
+// =====================================================
+// MODE FLAG
+// =====================================================
+bool isPrimary = true;
+
+// =====================================================
+// REPLICAS
+// =====================================================
+std::vector<int> replicas;
+std::mutex replica_mtx;
+
+// =====================================================
+// CLIENTS (FIX: REQUIRED)
+// =====================================================
+std::vector<int> clients;
+std::mutex client_mtx;
+
+// =====================================================
+// RANDOM
+// =====================================================
 std::mt19937 rng{std::random_device{}()};
 std::uniform_int_distribution<int> distX(1, WIDTH - 2);
 std::uniform_int_distribution<int> distY(1, HEIGHT - 2);
 
+// =====================================================
+// PLAYER
+// =====================================================
 struct Player
 {
     int id;
@@ -30,11 +54,14 @@ struct Player
     char symbol;
 };
 
+// =====================================================
+// GAME STATE
+// =====================================================
 class TronGame
 {
 private:
     std::vector<std::vector<char>> grid;
-    std::unordered_map<int, Player> players; // key = socket
+    std::unordered_map<int, Player> players;
     std::mutex mtx;
     std::atomic<int> nextId{1};
 
@@ -43,12 +70,12 @@ public:
     {
         grid.resize(HEIGHT, std::vector<char>(WIDTH, '.'));
 
-        // borders
         for (int x = 0; x < WIDTH; x++)
         {
             grid[0][x] = '#';
             grid[HEIGHT - 1][x] = '#';
         }
+
         for (int y = 0; y < HEIGHT; y++)
         {
             grid[y][0] = '#';
@@ -59,7 +86,6 @@ public:
     void addPlayer(int socket)
     {
         std::lock_guard<std::mutex> lock(mtx);
-        
 
         Player p;
         p.id = nextId++;
@@ -94,7 +120,8 @@ public:
     {
         std::lock_guard<std::mutex> lock(mtx);
 
-        if (!players.count(socket)) return;
+        if (!players.count(socket))
+            return;
 
         Player &p = players[socket];
 
@@ -114,19 +141,22 @@ public:
         for (auto &pair : players)
         {
             Player &p = pair.second;
-            if (!p.alive) continue;
+            if (!p.alive)
+                continue;
 
-            // leave trail
             grid[p.y][p.x] = '#';
 
-            // move
-            if (p.dir == "UP") p.y--;
-            else if (p.dir == "DOWN") p.y++;
-            else if (p.dir == "LEFT") p.x--;
-            else if (p.dir == "RIGHT") p.x++;
+            if (p.dir == "UP")
+                p.y--;
+            else if (p.dir == "DOWN")
+                p.y++;
+            else if (p.dir == "LEFT")
+                p.x--;
+            else if (p.dir == "RIGHT")
+                p.x++;
 
-            // collision
-            if (p.x < 0 || p.x >= WIDTH || p.y < 0 || p.y >= HEIGHT ||
+            if (p.x < 0 || p.x >= WIDTH ||
+                p.y < 0 || p.y >= HEIGHT ||
                 grid[p.y][p.x] == '#')
             {
                 p.alive = false;
@@ -152,32 +182,64 @@ public:
         out += "END\n";
         return out;
     }
-
-    std::vector<int> getSockets()
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-
-        std::vector<int> sockets;
-        for (auto &p : players)
-            sockets.push_back(p.first);
-
-        return sockets;
-    }
 };
 
-// ---------------- SERVER THREADS ----------------
+// =====================================================
+// BROADCAST REPLICAS
+// =====================================================
+void broadcastToReplicas(const std::string &msg)
+{
+    std::lock_guard<std::mutex> lock(replica_mtx);
 
+    for (auto it = replicas.begin(); it != replicas.end();)
+    {
+        if (send(*it, msg.c_str(), msg.size(), 0) <= 0)
+        {
+            close(*it);
+            it = replicas.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+// =====================================================
+// BROADCAST CLIENTS (FIX)
+// =====================================================
+void broadcastToClients(const std::string &msg)
+{
+    std::lock_guard<std::mutex> lock(client_mtx);
+
+    for (auto it = clients.begin(); it != clients.end();)
+    {
+        if (send(*it, msg.c_str(), msg.size(), 0) <= 0)
+        {
+            close(*it);
+            it = clients.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+// =====================================================
+// CLIENT HANDLER
+// =====================================================
 void clientHandler(TronGame &game, int socket)
 {
     char buffer[1024];
 
     while (true)
     {
-        int valread = recv(socket, buffer, sizeof(buffer), MSG_DONTWAIT);
+        int n = recv(socket, buffer, sizeof(buffer), MSG_DONTWAIT);
 
-        if (valread > 0)
+        if (n > 0)
         {
-            std::string input(buffer, valread);
+            std::string input(buffer, n);
 
             if (input.find("UP") != std::string::npos)
                 game.changeDirection(socket, "UP");
@@ -189,82 +251,105 @@ void clientHandler(TronGame &game, int socket)
                 game.changeDirection(socket, "RIGHT");
         }
 
-        memset(buffer, 0, sizeof(buffer));
-
-        if (valread == 0)
+        if (n == 0)
         {
             game.removePlayer(socket);
             break;
         }
 
+        memset(buffer, 0, sizeof(buffer));
         std::this_thread::sleep_for(std::chrono::milliseconds(30));
     }
 }
 
+// =====================================================
+// GAME LOOP (FIXED)
+// =====================================================
 void gameLoop(TronGame &game)
 {
-    while (true)
+    while (isPrimary)
     {
         game.moveAll();
 
         std::string state = game.buildGrid();
-        auto sockets = game.getSockets();
 
-        for (int s : sockets)
-        {
-            send(s, state.c_str(), state.size(), 0);
-        }
+        // ✅ SEND TO CLIENTS (FIX)
+        broadcastToClients(state);
+
+        // ✅ SEND TO REPLICAS
+        broadcastToReplicas(state);
 
         std::this_thread::sleep_for(std::chrono::milliseconds(150));
     }
 }
 
-// ---------------- MAIN ----------------
-
-int main()
+// =====================================================
+// MAIN
+// =====================================================
+int main(int argc, char *argv[])
 {
+    if (argc > 1 && std::string(argv[1]) == "replica")
+        isPrimary = false;
+
     int server_fd;
-    struct sockaddr_in address;
+    sockaddr_in address{};
     int opt = 1;
-    int addrlen = sizeof(address);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
     address.sin_port = htons(PORT);
+    address.sin_addr.s_addr = INADDR_ANY;
 
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0)
-    {
-        perror("bind failed");
-        return 1;
-    }
+    bind(server_fd, (sockaddr *)&address, sizeof(address));
+    listen(server_fd, 10);
 
-    if (listen(server_fd, 10) < 0)
-    {
-        perror("listen failed");
-        return 1;
-    }
-
-    std::cout << "Server running on port " << PORT << "\n";
+    std::cout << (isPrimary ? "PRIMARY" : "REPLICA")
+              << " running on port " << PORT << "\n";
 
     TronGame game;
 
-    // Start game loop
-    std::thread(gameLoop, std::ref(game)).detach();
-
-    while (true)
+    if (isPrimary)
     {
-        int client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t *)&addrlen);
+        std::thread(gameLoop, std::ref(game)).detach();
 
-        if (client_socket >= 0)
+        while (true)
         {
-            std::cout << "Client connected\n";
+            int client_socket = accept(server_fd, nullptr, nullptr);
 
-            game.addPlayer(client_socket);
+            if (client_socket >= 0)
+            {
+                std::cout << "Client connected\n";
 
-            std::thread(clientHandler, std::ref(game), client_socket).detach();
+                game.addPlayer(client_socket);
+
+                // initial sync
+                std::string init = game.buildGrid();
+                send(client_socket, init.c_str(), init.size(), 0);
+
+                {
+                    std::lock_guard<std::mutex> lock(client_mtx);
+                    clients.push_back(client_socket);
+                }
+
+                std::thread(clientHandler, std::ref(game), client_socket).detach();
+            }
+        }
+    }
+    else
+    {
+        while (true)
+        {
+            int sock = accept(server_fd, nullptr, nullptr);
+
+            if (sock >= 0)
+            {
+                std::lock_guard<std::mutex> lock(replica_mtx);
+                replicas.push_back(sock);
+
+                std::cout << "Replica connected\n";
+            }
         }
     }
 
