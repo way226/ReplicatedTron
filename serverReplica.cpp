@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -24,6 +25,7 @@
 
 #include "replication_protocol.h"
 #include "sunlab_config.h"
+#include "tick_lateness_logger.h"
 
 #define WIDTH 100
 #define HEIGHT 50
@@ -721,6 +723,12 @@ public:
         return epoch;
     }
 
+    std::uint64_t getPublishedTick()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        return publishedTick;
+    }
+
     std::uint64_t nextPromotionEpoch()
     {
         std::lock_guard<std::mutex> lock(mtx);
@@ -1401,19 +1409,31 @@ void witnessMonitorLoop(ReplicaNode &node,
 void leaderLoop(ReplicaNode &node,
                 const std::string &witnessHost,
                 int witnessPort,
-                const std::string &ownerId)
+                const std::string &ownerId,
+                std::shared_ptr<TickLatenessLogger> tickLogger)
 {
     int missedRenewals = 0;
+    bool tickScheduleStarted = false;
+    auto nextTickDueAt = TickLatenessLogger::Clock::time_point{};
 
     while (runReplica.load())
     {
         if (!node.isAuthoritative())
         {
+            tickScheduleStarted = false;
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
             continue;
         }
 
-        auto tickStart = std::chrono::steady_clock::now();
+        if (!tickScheduleStarted)
+        {
+            nextTickDueAt = TickLatenessLogger::Clock::now();
+            if (tickLogger)
+                tickLogger->startSchedule(node.getPublishedTick() + 1, nextTickDueAt);
+            tickScheduleStarted = true;
+        }
+
+        auto tickStart = TickLatenessLogger::Clock::now();
 
         WitnessReply renewReply = renewWitnessLease(witnessHost, witnessPort, ownerId, node.getEpoch());
         if (!renewReply.reachable)
@@ -1437,12 +1457,19 @@ void leaderLoop(ReplicaNode &node,
 
         node.leaderTick();
         sendFramesToClients(node);
+        auto publishAt = TickLatenessLogger::Clock::now();
 
-        auto elapsed = std::chrono::steady_clock::now() - tickStart;
-        auto sleepFor = std::chrono::milliseconds(kServerTickMs) -
-                        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
-        if (sleepFor.count() > 0)
-            std::this_thread::sleep_for(sleepFor);
+        if (tickLogger)
+        {
+            tickLogger->logPublishedTick(node.getEpoch(),
+                                         node.getPublishedTick(),
+                                         tickStart,
+                                         publishAt);
+        }
+
+        nextTickDueAt += std::chrono::milliseconds(kServerTickMs);
+        if (TickLatenessLogger::Clock::now() < nextTickDueAt)
+            std::this_thread::sleep_until(nextTickDueAt);
     }
 }
 
@@ -1454,6 +1481,8 @@ struct ServerStartupOptions
     int this_port = 0;
     std::string witness_host;
     int witness_port = 0;
+    std::string tick_log_path = "logs/tick_lateness_replica.csv";
+    std::size_t tick_log_limit = 1000;
 };
 
 void printServerUsage(const char *programName)
@@ -1461,7 +1490,8 @@ void printServerUsage(const char *programName)
     std::cout << "Usage: " << programName
               << " [--p_host <sunlab-host>] [--p_port 6000-6010]"
               << " [--this_host <sunlab-host>] [--this_port 6000-6010]"
-              << " [--w_host <sunlab-host>] [--w_port 6000-6010]\n";
+              << " [--w_host <sunlab-host>] [--w_port 6000-6010]"
+              << " [--tick_log <path|off>] [--tick_log_limit <count>]\n";
 }
 
 std::string localHostnameNormalized()
@@ -1495,6 +1525,30 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
             if (i + 1 >= argc)
                 return false;
             return parsePortInRange(argv[++i], out);
+        };
+
+        auto parseTickLogLimitArg = [&](std::size_t &out) -> bool
+        {
+            if (i + 1 >= argc)
+                return false;
+
+            std::string value = trim(argv[++i]);
+            if (value.empty())
+                return false;
+
+            try
+            {
+                size_t consumed = 0;
+                unsigned long long parsed = std::stoull(value, &consumed, 10);
+                if (consumed != value.size())
+                    return false;
+                out = static_cast<std::size_t>(parsed);
+                return true;
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
         };
 
         if (arg == "--p_host")
@@ -1552,6 +1606,27 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
             if (!parsePortArg(options.witness_port))
             {
                 std::cerr << "Invalid --w_port value.\n";
+                return false;
+            }
+            continue;
+        }
+
+        if (arg == "--tick_log")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Invalid --tick_log value.\n";
+                return false;
+            }
+            options.tick_log_path = argv[++i];
+            continue;
+        }
+
+        if (arg == "--tick_log_limit")
+        {
+            if (!parseTickLogLimitArg(options.tick_log_limit))
+            {
+                std::cerr << "Invalid --tick_log_limit value.\n";
                 return false;
             }
             continue;
@@ -1647,6 +1722,23 @@ int main(int argc, char *argv[])
     ReplicaNode node;
     std::cout << "REPLICA running on " << toConnectHost(options.this_host) << " port " << options.this_port << "\n";
     std::cout << "Witness on " << toConnectHost(options.witness_host) << ":" << options.witness_port << "\n";
+    auto tickLogger = std::make_shared<TickLatenessLogger>(options.tick_log_path,
+                                                           "promoted_replica",
+                                                           toConnectHost(options.this_host) + ":" + std::to_string(options.this_port),
+                                                           kServerTickMs,
+                                                           options.tick_log_limit);
+    if (tickLogger->enabled())
+    {
+        std::cout << "Tick lateness log: " << tickLogger->path();
+        if (tickLogger->maxSamples() == 0)
+            std::cout << " (all authoritative ticks after promotion)\n";
+        else
+            std::cout << " (first " << tickLogger->maxSamples() << " authoritative ticks after promotion)\n";
+    }
+    else
+    {
+        std::cout << "Tick lateness log: disabled\n";
+    }
 
     connectToPrimary(toConnectHost(options.primary_host), options.primary_port);
     std::string ownerId = toConnectHost(options.this_host) + ":" + std::to_string(options.this_port);
@@ -1661,7 +1753,8 @@ int main(int argc, char *argv[])
                 std::ref(node),
                 toConnectHost(options.witness_host),
                 options.witness_port,
-                ownerId)
+                ownerId,
+                tickLogger)
         .detach();
 
     while (runReplica.load())

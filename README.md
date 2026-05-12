@@ -10,8 +10,8 @@ How to run (interactive)
 5. If joining as a client, enter a player name for winner/status messages
 
 Direct run options
-1. Start the primary with `./serverPrimary --host <node> --port <6000-6010>`
-2. Start the replica with `./serverReplica --p_host <primary-node> --p_port <6000-6010> --this_host <replica-node> --this_port <6000-6010>`
+1. Start the primary with `./serverPrimary --host <node> --port <6000-6010> [--w_host <node>] [--w_port <6000-6010>] [--tick_log <path|off>] [--tick_log_limit <count>]`
+2. Start the replica with `./serverReplica --p_host <primary-node> --p_port <6000-6010> --this_host <replica-node> --this_port <6000-6010> [--w_host <node>] [--w_port <6000-6010>] [--tick_log <path|off>] [--tick_log_limit <count>]`
 3. Start a client with `./client --host <node> --port <6000-6010> [--name <player-name>]`
 
 Gameplay flow
@@ -129,6 +129,17 @@ What this approach gives us
 
 Evaluation note
 - One of our main performance evaluations should log and graph per-tick lateness over time using `tick_lateness(n) = max(0, tick_publish_at(n) - tick_due_at(n))`.
+
+Tick lateness workflow
+- We log this directly to CSV from the authoritative tick loop instead of scraping free-form console output.
+- The primary writes `logs/tick_lateness_primary.csv` by default.
+- The replica writes `logs/tick_lateness_replica.csv` by default, but only records samples after it actually promotes and becomes authoritative.
+- Each row stores `epoch`, `tick`, scheduled due time, actual publish time, tick runtime, and computed lateness in milliseconds.
+- By default we keep the first `1000` authoritative tick samples, which matches the suggested evaluation window. Use `--tick_log_limit 0` to keep all samples.
+- Use `--tick_log off` if you want to disable the CSV for a run.
+- The plotting helper expects `matplotlib`; install it with `python3 -m pip install matplotlib` if needed.
+- Generate the graph with `python3 tools/plot_tick_lateness.py logs/tick_lateness_primary.csv`.
+- To write to a specific image path, run `python3 tools/plot_tick_lateness.py logs/tick_lateness_primary.csv --output primary_lateness.png`.
 
 ## Remaining Replication Work
 

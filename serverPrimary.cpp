@@ -9,6 +9,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -25,6 +26,7 @@
 
 #include "replication_protocol.h"
 #include "sunlab_config.h"
+#include "tick_lateness_logger.h"
 
 #define WIDTH 100
 #define HEIGHT 50
@@ -1296,14 +1298,19 @@ void clientHandler(TronGame &game, int socket)
 void gameLoop(TronGame &game,
               const std::string &witnessHost,
               int witnessPort,
-              const std::string &leaderId)
+              const std::string &leaderId,
+              std::shared_ptr<TickLatenessLogger> tickLogger)
 {
     int missedWitnessRenewals = 0;
     bool witnessAvailable = true;
+    auto nextTickDueAt = TickLatenessLogger::Clock::now();
+
+    if (tickLogger)
+        tickLogger->startSchedule(game.getPublishedTick() + 1, nextTickDueAt);
 
     while (runPrimary.load())
     {
-        auto tickStart = std::chrono::steady_clock::now();
+        auto tickStart = TickLatenessLogger::Clock::now();
 
         WitnessReply renewReply = renewWitnessLease(witnessHost, witnessPort, leaderId, game.getEpoch());
         if (!renewReply.reachable)
@@ -1328,6 +1335,15 @@ void gameLoop(TronGame &game,
         game.setReplicaSafeTickHint(replicaVerifiedSafeTick.load());
         TickArtifacts artifacts = game.advanceTick();
         sendFramesToClients(game);
+        auto publishAt = TickLatenessLogger::Clock::now();
+
+        if (tickLogger)
+        {
+            tickLogger->logPublishedTick(artifacts.checkpoint.epoch,
+                                         artifacts.checkpoint.publishedTick,
+                                         tickStart,
+                                         publishAt);
+        }
 
         HeartbeatMessage heartbeat;
         heartbeat.epoch = artifacts.checkpoint.epoch;
@@ -1341,11 +1357,9 @@ void gameLoop(TronGame &game,
         if (artifacts.sendCheckpoint)
             broadcastToReplica(serializeCheckpoint(artifacts.checkpoint));
 
-        auto elapsed = std::chrono::steady_clock::now() - tickStart;
-        auto sleepFor = std::chrono::milliseconds(kServerTickMs) -
-                        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
-        if (sleepFor.count() > 0)
-            std::this_thread::sleep_for(sleepFor);
+        nextTickDueAt += std::chrono::milliseconds(kServerTickMs);
+        if (TickLatenessLogger::Clock::now() < nextTickDueAt)
+            std::this_thread::sleep_until(nextTickDueAt);
     }
 }
 
@@ -1355,13 +1369,16 @@ struct ServerStartupOptions
     int port = 0;
     std::string witness_host;
     int witness_port = 0;
+    std::string tick_log_path = "logs/tick_lateness_primary.csv";
+    std::size_t tick_log_limit = 1000;
 };
 
 void printServerUsage(const char *programName)
 {
     std::cout << "Usage: " << programName
               << " [--host <sunlab-host>] [--port 6000-6010]"
-              << " [--w_host <sunlab-host>] [--w_port 6000-6010]\n";
+              << " [--w_host <sunlab-host>] [--w_port 6000-6010]"
+              << " [--tick_log <path|off>] [--tick_log_limit <count>]\n";
 }
 
 std::string localHostnameNormalized()
@@ -1395,6 +1412,30 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
             if (i + 1 >= argc)
                 return false;
             return parsePortInRange(argv[++i], out);
+        };
+
+        auto parseTickLogLimitArg = [&](std::size_t &out) -> bool
+        {
+            if (i + 1 >= argc)
+                return false;
+
+            std::string value = trim(argv[++i]);
+            if (value.empty())
+                return false;
+
+            try
+            {
+                size_t consumed = 0;
+                unsigned long long parsed = std::stoull(value, &consumed, 10);
+                if (consumed != value.size())
+                    return false;
+                out = static_cast<std::size_t>(parsed);
+                return true;
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
         };
 
         if (arg == "--host")
@@ -1432,6 +1473,27 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
             if (!parsePortArg(options.witness_port))
             {
                 std::cerr << "Invalid --w_port value.\n";
+                return false;
+            }
+            continue;
+        }
+
+        if (arg == "--tick_log")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Invalid --tick_log value.\n";
+                return false;
+            }
+            options.tick_log_path = argv[++i];
+            continue;
+        }
+
+        if (arg == "--tick_log_limit")
+        {
+            if (!parseTickLogLimitArg(options.tick_log_limit))
+            {
+                std::cerr << "Invalid --tick_log_limit value.\n";
                 return false;
             }
             continue;
@@ -1528,15 +1590,33 @@ int main(int argc, char *argv[])
 
     TronGame game;
     game.setEpoch(acquireReply.epoch);
+    auto tickLogger = std::make_shared<TickLatenessLogger>(options.tick_log_path,
+                                                           "primary",
+                                                           leaderId,
+                                                           kServerTickMs,
+                                                           options.tick_log_limit);
     std::thread(gameLoop,
                 std::ref(game),
                 toConnectHost(options.witness_host),
                 options.witness_port,
-                leaderId)
+                leaderId,
+                tickLogger)
         .detach();
 
     std::cout << "PRIMARY running on " << toConnectHost(options.host) << " port " << options.port << "\n";
     std::cout << "Witness on " << toConnectHost(options.witness_host) << ":" << options.witness_port << "\n";
+    if (tickLogger->enabled())
+    {
+        std::cout << "Tick lateness log: " << tickLogger->path();
+        if (tickLogger->maxSamples() == 0)
+            std::cout << " (all authoritative ticks)\n";
+        else
+            std::cout << " (first " << tickLogger->maxSamples() << " authoritative ticks)\n";
+    }
+    else
+    {
+        std::cout << "Tick lateness log: disabled\n";
+    }
 
     while (runPrimary.load())
     {
