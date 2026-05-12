@@ -104,6 +104,9 @@ What this approach gives us
 - Cleaner client behavior during failover because clients only need to trust the highest `epoch` and accept the new authoritative frame.
 - A concrete promotion rule that avoids two servers becoming leader at the same time.
 
+Evaluation note
+- One of our main performance evaluations should log and graph per-tick lateness over time using `tick_lateness(n) = max(0, tick_publish_at(n) - tick_due_at(n))`.
+
 Current status
 - Right now the replica path is still incomplete in code.
 - The existing replica logic only receives limited state and does not yet implement full deterministic replay, `published_tick`, `safe_tick`, epoch-based promotion, or client cutover behavior.
