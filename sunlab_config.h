@@ -63,6 +63,24 @@ inline bool isValidSunlabHost(const std::string &hostInput)
                        { return host == candidate; });
 }
 
+inline bool isLoopbackHost(const std::string &hostInput)
+{
+    std::string host = toLower(trim(hostInput));
+    return host == "localhost" || host == "127.0.0.1";
+}
+
+inline bool isValidConfiguredHost(const std::string &hostInput)
+{
+    return isValidSunlabHost(hostInput) || isLoopbackHost(hostInput);
+}
+
+inline std::string normalizeConfiguredHost(const std::string &hostInput)
+{
+    if (isLoopbackHost(hostInput))
+        return toLower(trim(hostInput));
+    return normalizeSunlabHost(hostInput);
+}
+
 inline std::string toSunlabFqdn(const std::string &hostInput)
 {
     std::string host = normalizeSunlabHost(hostInput);
@@ -70,6 +88,13 @@ inline std::string toSunlabFqdn(const std::string &hostInput)
         return "";
 
     return host + kSunlabDomain;
+}
+
+inline std::string toConnectHost(const std::string &hostInput)
+{
+    if (isLoopbackHost(hostInput))
+        return toLower(trim(hostInput));
+    return toSunlabFqdn(hostInput);
 }
 
 inline bool parsePortInRange(const std::string &portInput, int &portOut)

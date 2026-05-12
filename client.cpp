@@ -1,18 +1,23 @@
-#include <iostream>
-#include <unistd.h>
 #include <arpa/inet.h>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
+#include <netdb.h>
+#include <sstream>
 #include <string>
-#include <thread>
+#include <sys/socket.h>
 #include <termios.h>
+#include <thread>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 #include <cctype>
-#include <netdb.h>
-#include <cstdio>
-#include <cstdlib>
-#include <atomic>
-#include <sstream>
+#include <mutex>
 
+#include "replication_protocol.h"
 #include "sunlab_config.h"
 
 const std::string playerUpRune = "\xE2\x87\xA1";
@@ -49,7 +54,7 @@ struct PlayerRenderState
     bool hasHead = false;
 };
 
-Direction directionBetween(const Position& from, const Position& to)
+Direction directionBetween(const Position &from, const Position &to)
 {
     int dx = to.x - from.x;
     int dy = to.y - from.y;
@@ -79,7 +84,7 @@ Direction opposite(Direction dir)
     return Direction::Unknown;
 }
 
-const std::string& headRuneFor(Direction dir)
+const std::string &headRuneFor(Direction dir)
 {
     if (dir == Direction::Up)
         return playerUpRune;
@@ -90,7 +95,7 @@ const std::string& headRuneFor(Direction dir)
     return playerRightRune;
 }
 
-const std::string& trailRuneFor(Direction connectionA, Direction connectionB)
+const std::string &trailRuneFor(Direction connectionA, Direction connectionB)
 {
     bool hasUp = connectionA == Direction::Up || connectionB == Direction::Up;
     bool hasLeft = connectionA == Direction::Left || connectionB == Direction::Left;
@@ -113,7 +118,7 @@ const std::string& trailRuneFor(Direction connectionA, Direction connectionB)
     return playerTrailHorizontal;
 }
 
-std::vector<std::string> splitLines(const std::string& text)
+std::vector<std::string> splitLines(const std::string &text)
 {
     std::vector<std::string> lines;
     std::string current;
@@ -142,13 +147,13 @@ std::vector<std::string> splitLines(const std::string& text)
     return lines;
 }
 
-bool looksLikeGrid(const std::vector<std::string>& rows)
+bool looksLikeGrid(const std::vector<std::string> &rows)
 {
     if (rows.empty() || rows.front().empty())
         return false;
 
     size_t width = rows.front().size();
-    for (const std::string& row : rows)
+    for (const std::string &row : rows)
     {
         if (row.size() != width)
             return false;
@@ -164,9 +169,9 @@ bool looksLikeGrid(const std::vector<std::string>& rows)
 }
 
 std::string renderGrid(
-    const std::string& rawGrid,
-    std::unordered_map<char, PlayerRenderState>& playerStates,
-    std::vector<std::vector<std::string>>& frozenTrailRunes)
+    const std::string &rawGrid,
+    std::unordered_map<char, PlayerRenderState> &playerStates,
+    std::vector<std::vector<std::string>> &frozenTrailRunes)
 {
     std::vector<std::string> rows = splitLines(rawGrid);
     if (!looksLikeGrid(rows))
@@ -201,9 +206,9 @@ std::string renderGrid(
             ++it;
     }
 
-    for (const auto& [playerId, currentHead] : heads)
+    for (const auto &[playerId, currentHead] : heads)
     {
-        PlayerRenderState& state = playerStates[playerId];
+        PlayerRenderState &state = playerStates[playerId];
 
         if (state.hasHead)
         {
@@ -268,7 +273,6 @@ std::string renderGrid(
     return rendered;
 }
 
-// get single char input (no enter needed)
 char getch()
 {
     struct termios oldt, newt;
@@ -299,6 +303,11 @@ std::string mapKey(char c)
 
 struct ServerFrame
 {
+    unsigned long long epoch = 0;
+    unsigned long long tick = 0;
+    unsigned long long publishedTick = 0;
+    unsigned long long safeTick = 0;
+    bool authoritative = true;
     std::string phase = "UNKNOWN";
     std::string role = "PLAYER";
     bool alive = true;
@@ -344,7 +353,17 @@ ServerFrame parseFrame(const std::string &rawFrame)
         std::string key = line.substr(0, equals);
         std::string value = line.substr(equals + 1);
 
-        if (key == "phase")
+        if (key == "epoch")
+            frame.epoch = std::strtoull(value.c_str(), nullptr, 10);
+        else if (key == "tick")
+            frame.tick = std::strtoull(value.c_str(), nullptr, 10);
+        else if (key == "published_tick")
+            frame.publishedTick = std::strtoull(value.c_str(), nullptr, 10);
+        else if (key == "safe_tick")
+            frame.safeTick = std::strtoull(value.c_str(), nullptr, 10);
+        else if (key == "authoritative")
+            frame.authoritative = value == "1";
+        else if (key == "phase")
             frame.phase = value;
         else if (key == "role")
             frame.role = value;
@@ -371,9 +390,14 @@ ServerFrame parseFrame(const std::string &rawFrame)
     return frame;
 }
 
-void printStatusBar(const ServerFrame &frame)
+void printStatusBar(const ServerFrame &frame, const std::string &sourceLabel)
 {
     std::cout << "--------------------------------------------------------------------------------\n";
+    std::cout << "Source: " << sourceLabel;
+    std::cout << " | Epoch: " << frame.epoch;
+    std::cout << " | Tick: " << frame.tick;
+    std::cout << " | Published: " << frame.publishedTick;
+    std::cout << " | Safe: " << frame.safeTick << "\n";
     std::cout << "Role: " << frame.role << " | ";
 
     if (frame.role == "PLAYER")
@@ -393,7 +417,10 @@ void printStatusBar(const ServerFrame &frame)
     if (!frame.status.empty())
         std::cout << frame.status << "\n";
 
-    bool moveEnabled = frame.role == "PLAYER" && frame.alive && frame.phase == "IN_PROGRESS";
+    bool moveEnabled = frame.authoritative &&
+                       frame.role == "PLAYER" &&
+                       frame.alive &&
+                       frame.phase == "IN_PROGRESS";
     std::cout << "Controls: R=start";
     if (moveEnabled)
         std::cout << " | WASD=move";
@@ -406,13 +433,17 @@ struct ClientStartupOptions
 {
     std::string host;
     int port = 0;
+    std::string replicaHost;
+    int replicaPort = 0;
     std::string name;
 };
 
 void printClientUsage(const char *programName)
 {
     std::cout << "Usage: " << programName
-              << " [--host <sunlab-host>] [--port 6000-6010] [--name <player-name>]\n";
+              << " [--host <sunlab-host>] [--port 6000-6010]"
+              << " [--replica_host <sunlab-host>] [--replica_port 6000-6010]"
+              << " [--name <player-name>]\n";
 }
 
 bool parseClientArgs(int argc, char *argv[], ClientStartupOptions &options)
@@ -421,43 +452,61 @@ bool parseClientArgs(int argc, char *argv[], ClientStartupOptions &options)
     {
         std::string arg = argv[i];
 
-        if (arg == "--host")
+        auto parseHostArg = [&](std::string &out) -> bool
         {
             if (i + 1 >= argc)
-            {
-                std::cerr << "--host requires a value.\n";
                 return false;
-            }
-
             std::string parsedHost = argv[++i];
-            if (!isValidSunlabHost(parsedHost))
+            if (!isValidConfiguredHost(parsedHost))
+                return false;
+            out = normalizeConfiguredHost(parsedHost);
+            return true;
+        };
+
+        auto parsePortArg = [&](int &out) -> bool
+        {
+            if (i + 1 >= argc)
+                return false;
+            return parsePortInRange(argv[++i], out);
+        };
+
+        if (arg == "--host")
+        {
+            if (!parseHostArg(options.host))
             {
-                std::cerr << "Invalid host '" << parsedHost
-                          << "'. Host must be one of the Sunlab nodes.\n";
+                std::cerr << "Invalid --host value.\n";
                 return false;
             }
-
-            options.host = normalizeSunlabHost(parsedHost);
             continue;
         }
 
         if (arg == "--port")
         {
-            if (i + 1 >= argc)
+            if (!parsePortArg(options.port))
             {
-                std::cerr << "--port requires a value.\n";
+                std::cerr << "Invalid --port value.\n";
                 return false;
             }
+            continue;
+        }
 
-            int parsedPort = 0;
-            if (!parsePortInRange(argv[++i], parsedPort))
+        if (arg == "--replica_host")
+        {
+            if (!parseHostArg(options.replicaHost))
             {
-                std::cerr << "Invalid port. Use an integer in [" << kMinAllowedPort
-                          << "," << kMaxAllowedPort << "].\n";
+                std::cerr << "Invalid --replica_host value.\n";
                 return false;
             }
+            continue;
+        }
 
-            options.port = parsedPort;
+        if (arg == "--replica_port")
+        {
+            if (!parsePortArg(options.replicaPort))
+            {
+                std::cerr << "Invalid --replica_port value.\n";
+                return false;
+            }
             continue;
         }
 
@@ -504,7 +553,8 @@ int connectToHost(const std::string &host, int port)
     int rc = getaddrinfo(host.c_str(), portText.c_str(), &hints, &results);
     if (rc != 0)
     {
-        std::cerr << "getaddrinfo failed for " << host << ":" << port << " (" << gai_strerror(rc) << ")\n";
+        std::cerr << "getaddrinfo failed for " << host << ":" << port
+                  << " (" << gai_strerror(rc) << ")\n";
         return -1;
     }
 
@@ -524,6 +574,170 @@ int connectToHost(const std::string &host, int port)
 
     freeaddrinfo(results);
     return sock;
+}
+
+std::string buildClientId(const std::string &playerName)
+{
+    std::string base = sanitizePlayerName(playerName);
+    if (base.empty())
+        base = "Player";
+
+    std::string compact;
+    compact.reserve(base.size());
+    for (char c : base)
+    {
+        if (c == ' ')
+            compact.push_back('_');
+        else
+            compact.push_back(c);
+    }
+
+    if (compact.size() > 14)
+        compact = compact.substr(0, 14);
+
+    std::uint64_t seed = static_cast<std::uint64_t>(::getpid()) ^
+                         static_cast<std::uint64_t>(std::chrono::steady_clock::now().time_since_epoch().count());
+    std::ostringstream suffix;
+    suffix << std::hex << (seed & 0xFFFFFF);
+
+    std::string out = compact + "-" + suffix.str();
+    if (out.size() > 24)
+        out = out.substr(0, 24);
+    return out;
+}
+
+struct RenderDecision
+{
+    bool shouldRender = false;
+    ServerFrame frame;
+    std::string sourceLabel;
+};
+
+struct SharedDisplayState
+{
+    std::mutex mtx;
+    ServerFrame authoritativeFrame;
+    bool hasAuthoritative = false;
+    unsigned long long highestAuthoritativeEpoch = 0;
+    unsigned long long highestAuthoritativeTick = 0;
+    unsigned long long latestSeenTick = 0;
+    bool controlsEnabled = false;
+
+    RenderDecision considerFrame(const ServerFrame &frame, const std::string &sourceLabel)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        latestSeenTick = std::max(latestSeenTick, frame.tick);
+
+        RenderDecision decision;
+        if (!frame.authoritative)
+            return decision;
+
+        bool newer = !hasAuthoritative ||
+                     frame.epoch > highestAuthoritativeEpoch ||
+                     (frame.epoch == highestAuthoritativeEpoch && frame.tick >= highestAuthoritativeTick);
+        if (!newer)
+            return decision;
+
+        authoritativeFrame = frame;
+        hasAuthoritative = true;
+        highestAuthoritativeEpoch = frame.epoch;
+        highestAuthoritativeTick = frame.tick;
+        controlsEnabled = frame.role == "PLAYER" && frame.alive && frame.phase == "IN_PROGRESS";
+
+        decision.shouldRender = true;
+        decision.frame = authoritativeFrame;
+        decision.sourceLabel = sourceLabel;
+        return decision;
+    }
+
+    void snapshotForInput(unsigned long long &epochOut,
+                          unsigned long long &targetTickOut,
+                          bool &controlsOut)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        epochOut = hasAuthoritative ? highestAuthoritativeEpoch : 0;
+        unsigned long long baseTick = hasAuthoritative ? highestAuthoritativeTick : latestSeenTick;
+        targetTickOut = baseTick + 2;
+        controlsOut = controlsEnabled;
+    }
+};
+
+struct ConnectionTarget
+{
+    std::string label;
+    std::string host;
+    int port = 0;
+    int socket = -1;
+    std::atomic<bool> connected{false};
+};
+
+bool sendHello(ConnectionTarget &target, const std::string &clientId, const std::string &playerName)
+{
+    if (target.socket < 0)
+        return false;
+
+    if (send(target.socket, "CLIENT\n", 7, 0) <= 0)
+        return false;
+
+    std::string hello = buildHelloLine(clientId, playerName);
+    return send(target.socket, hello.c_str(), hello.size(), 0) > 0;
+}
+
+void receiverLoop(ConnectionTarget &target,
+                  SharedDisplayState &displayState,
+                  std::mutex &renderMtx,
+                  std::unordered_map<char, PlayerRenderState> &playerStates,
+                  std::vector<std::vector<std::string>> &frozenTrailRunes)
+{
+    std::string buffer;
+    char recvBuffer[2048];
+
+    while (target.connected.load())
+    {
+        int bytes = recv(target.socket, recvBuffer, sizeof(recvBuffer), 0);
+        if (bytes > 0)
+        {
+            buffer.append(recvBuffer, bytes);
+
+            size_t pos;
+            while ((pos = buffer.find("END\n")) != std::string::npos)
+            {
+                std::string rawFrame = buffer.substr(0, pos);
+                buffer.erase(0, pos + 4);
+
+                ServerFrame frame = parseFrame(rawFrame);
+                RenderDecision decision = displayState.considerFrame(frame, target.label);
+                if (!decision.shouldRender)
+                    continue;
+
+                std::string rendered = renderGrid(decision.frame.grid, playerStates, frozenTrailRunes);
+
+                std::lock_guard<std::mutex> renderLock(renderMtx);
+                std::system("clear");
+                std::cout << rendered << std::flush;
+                printStatusBar(decision.frame, decision.sourceLabel);
+            }
+            continue;
+        }
+
+        if (bytes == 0)
+        {
+            std::lock_guard<std::mutex> renderLock(renderMtx);
+            std::cout << target.label << " disconnected.\n";
+            break;
+        }
+
+        std::lock_guard<std::mutex> renderLock(renderMtx);
+        std::perror(("recv " + target.label).c_str());
+        break;
+    }
+
+    target.connected = false;
+    if (target.socket >= 0)
+    {
+        close(target.socket);
+        target.socket = -1;
+    }
 }
 
 int main(int argc, char *argv[])
@@ -551,86 +765,127 @@ int main(int argc, char *argv[])
             options.name = promptForPlayerName();
     }
 
-    std::string fqdn = toSunlabFqdn(options.host);
-    int sock = connectToHost(fqdn, options.port);
-    if (sock < 0)
+    std::string clientId = buildClientId(options.name);
+
+    ConnectionTarget primary;
+    primary.label = "PRIMARY";
+    primary.host = toConnectHost(options.host);
+    primary.port = options.port;
+    primary.socket = connectToHost(primary.host, primary.port);
+    if (primary.socket < 0)
     {
-        std::cerr << "Unable to connect to " << fqdn << ":" << options.port << "\n";
+        std::cerr << "Unable to connect to " << primary.host << ":" << primary.port << "\n";
+        return 1;
+    }
+    primary.connected = true;
+
+    ConnectionTarget replica;
+    bool haveReplica = !options.replicaHost.empty() && options.replicaPort != 0;
+    if (haveReplica)
+    {
+        replica.label = "REPLICA";
+        replica.host = toConnectHost(options.replicaHost);
+        replica.port = options.replicaPort;
+        replica.socket = connectToHost(replica.host, replica.port);
+        if (replica.socket < 0)
+        {
+            std::cerr << "Warning: unable to connect to standby replica "
+                      << replica.host << ":" << replica.port << ". Continuing with primary only.\n";
+            haveReplica = false;
+        }
+        else
+        {
+            replica.connected = true;
+        }
+    }
+
+    if (!sendHello(primary, clientId, options.name))
+    {
+        std::cerr << "Failed to send hello to primary.\n";
+        close(primary.socket);
         return 1;
     }
 
-    std::cout << "Connected to " << fqdn << ":" << options.port << "\n";
+    if (haveReplica && !sendHello(replica, clientId, options.name))
+    {
+        std::cerr << "Warning: failed to send hello to replica. Continuing without standby connection.\n";
+        close(replica.socket);
+        replica.socket = -1;
+        replica.connected = false;
+        haveReplica = false;
+    }
 
-    send(sock, "CLIENT\n", 7, 0);
-    std::string nameMessage = "NAME:" + options.name + "\n";
-    send(sock, nameMessage.c_str(), nameMessage.size(), 0);
+    std::cout << "Connected to primary " << primary.host << ":" << primary.port << "\n";
+    if (haveReplica)
+        std::cout << "Connected to replica " << replica.host << ":" << replica.port << "\n";
+    std::cout << "Player name: " << options.name << "\n";
+    std::cout << "Client ID: " << clientId << "\n";
 
-    std::string buffer = "";
+    SharedDisplayState displayState;
+    std::mutex renderMtx;
     std::unordered_map<char, PlayerRenderState> playerStates;
     std::vector<std::vector<std::string>> frozenTrailRunes;
-    std::atomic<bool> controlsEnabled{false};
 
-    // input thread
+    std::thread primaryThread(receiverLoop,
+                              std::ref(primary),
+                              std::ref(displayState),
+                              std::ref(renderMtx),
+                              std::ref(playerStates),
+                              std::ref(frozenTrailRunes));
+
+    std::thread replicaThread;
+    if (haveReplica)
+    {
+        replicaThread = std::thread(receiverLoop,
+                                    std::ref(replica),
+                                    std::ref(displayState),
+                                    std::ref(renderMtx),
+                                    std::ref(playerStates),
+                                    std::ref(frozenTrailRunes));
+    }
+
+    std::atomic<unsigned long long> clientSeq{0};
+
     std::thread inputThread([&]()
                             {
-        while (true) {
+        while (primary.connected.load() || (haveReplica && replica.connected.load()))
+        {
             char c = getch();
             std::string command = mapKey(c);
             if (command.empty())
                 continue;
 
-            if (command == "START") {
-                send(sock, command.c_str(), command.size(), 0);
-                continue;
-            }
+            unsigned long long epochHint = 0;
+            unsigned long long targetTick = 0;
+            bool controlsEnabled = false;
+            displayState.snapshotForInput(epochHint, targetTick, controlsEnabled);
 
-            if (!controlsEnabled.load())
+            if (command != "START" && !controlsEnabled)
                 continue;
 
-            send(sock, command.c_str(), command.size(), 0);
+            ReplicatedInput input;
+            input.epochHint = epochHint;
+            input.clientId = clientId;
+            input.clientSeq = ++clientSeq;
+            input.targetTick = targetTick;
+            input.command = command;
+
+            std::string wire = serializeInputLine(input);
+            if (primary.connected.load() && primary.socket >= 0)
+                send(primary.socket, wire.c_str(), wire.size(), 0);
+            if (haveReplica && replica.connected.load() && replica.socket >= 0)
+                send(replica.socket, wire.c_str(), wire.size(), 0);
         } });
     inputThread.detach();
 
-    char recv_buffer[1024];
+    primaryThread.join();
+    if (haveReplica)
+        replicaThread.join();
 
-    while (true)
-    {
-        int valread = recv(sock, recv_buffer, sizeof(recv_buffer), 0);
+    if (primary.socket >= 0)
+        close(primary.socket);
+    if (haveReplica && replica.socket >= 0)
+        close(replica.socket);
 
-        if (valread > 0)
-        {
-            buffer.append(recv_buffer, valread);
-
-            // check for END delimiter
-            size_t pos;
-            while ((pos = buffer.find("END\n")) != std::string::npos)
-            {
-                std::string rawFrame = buffer.substr(0, pos);
-                buffer.erase(0, pos + 4);
-
-                ServerFrame frame = parseFrame(rawFrame);
-                controlsEnabled.store(frame.role == "PLAYER" &&
-                                      frame.alive &&
-                                      frame.phase == "IN_PROGRESS");
-
-                std::string rendered = renderGrid(frame.grid, playerStates, frozenTrailRunes);
-                std::system("clear");
-                std::cout << rendered << std::flush;
-                printStatusBar(frame);
-            }
-        }
-        else if (valread == 0)
-        {
-            std::cout << "Disconnected from server.\n";
-            break;
-        }
-        else
-        {
-            std::perror("recv");
-            break;
-        }
-    }
-
-    close(sock);
     return 0;
 }

@@ -1,7 +1,10 @@
 CXX = g++
 CXXFLAGS = -Wall -std=c++17 -pthread
 
-all: serverPrimary serverReplica client launcher
+all: witness serverPrimary serverReplica client launcher
+
+witness: witness.cpp
+	$(CXX) $(CXXFLAGS) witness.cpp -o witness
 
 serverPrimary: serverPrimary.cpp
 	$(CXX) $(CXXFLAGS) serverPrimary.cpp -o serverPrimary
@@ -16,4 +19,4 @@ launcher: launcher.cpp
 	$(CXX) $(CXXFLAGS) launcher.cpp -o launcher
 
 clean:
-	rm -f serverPrimary serverReplica client launcher
+	rm -f witness serverPrimary serverReplica client launcher

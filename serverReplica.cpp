@@ -1,144 +1,329 @@
 #include <algorithm>
+#include <arpa/inet.h>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <mutex>
-#include <arpa/inet.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <random>
 #include <sstream>
 #include <string>
-#include <netdb.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
-#include <cerrno>
-#include <condition_variable>
 
+#include "replication_protocol.h"
 #include "sunlab_config.h"
 
 #define WIDTH 100
 #define HEIGHT 50
 
 constexpr int kServerTickMs = 150;
-constexpr int kCountdownSeconds = 5;
-constexpr int kMatchDurationSeconds = 90;
 constexpr int kMinimumPlayersToStart = 1;
+constexpr int kCountdownTicks = 34;
+constexpr int kMatchDurationTicks = 600;
+constexpr int kWitnessLeaseMs = 600;
+constexpr int kWitnessTimeoutMs = 80;
 
-bool isPrimary = true;
-
-std::mutex replica_mtx;
-std::condition_variable replica_cv;
-std::atomic<bool> replicaConnected{false};
-int replicaSocket = -1;
+std::atomic<bool> runReplica{true};
+int primarySocket = -1;
+std::mutex primarySocketMtx;
 
 std::vector<int> clients;
-std::mutex client_mtx;
+std::mutex clientMtx;
 
 std::mt19937 rng{std::random_device{}()};
 std::uniform_int_distribution<int> distX(1, WIDTH - 2);
 std::uniform_int_distribution<int> distY(1, HEIGHT - 2);
 
-int primarySocket = -1;
-
-struct Player
+struct MirroredPlayer
 {
-    int id = 0;
+    std::string clientId;
+    std::string name;
+    char symbol = '?';
     int x = 0;
     int y = 0;
     int spawnX = 0;
     int spawnY = 0;
     std::string dir = "RIGHT";
-    int socket = -1;
     bool alive = true;
-    char symbol = 'A';
-    std::string name;
 };
 
-enum class GamePhase
+struct WitnessReply
 {
-    Waiting,
-    Countdown,
-    InProgress,
-    Finished
+    bool reachable = false;
+    bool granted = false;
+    std::uint64_t epoch = 0;
+    std::string owner;
+    int ttlMs = 0;
 };
 
-std::string phaseToString(GamePhase phase)
+bool setSocketBlocking(int socket, bool blocking)
 {
-    if (phase == GamePhase::Waiting)
-        return "WAITING";
-    if (phase == GamePhase::Countdown)
-        return "COUNTDOWN";
-    if (phase == GamePhase::InProgress)
-        return "IN_PROGRESS";
-    return "FINISHED";
+    int flags = fcntl(socket, F_GETFL, 0);
+    if (flags < 0)
+        return false;
+
+    if (blocking)
+        flags &= ~O_NONBLOCK;
+    else
+        flags |= O_NONBLOCK;
+
+    return fcntl(socket, F_SETFL, flags) == 0;
 }
 
-int secondsRemaining(const std::chrono::steady_clock::time_point &endTime,
-                     const std::chrono::steady_clock::time_point &now)
+int connectToHostWithTimeout(const std::string &host, int port, int timeoutMs)
 {
-    if (now >= endTime)
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo *results = nullptr;
+    std::string portText = std::to_string(port);
+    int rc = getaddrinfo(host.c_str(), portText.c_str(), &hints, &results);
+    if (rc != 0)
+        return -1;
+
+    int sock = -1;
+    for (addrinfo *candidate = results; candidate != nullptr; candidate = candidate->ai_next)
+    {
+        sock = socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
+        if (sock < 0)
+            continue;
+
+        if (!setSocketBlocking(sock, false))
+        {
+            close(sock);
+            sock = -1;
+            continue;
+        }
+
+        int connectRc = connect(sock, candidate->ai_addr, candidate->ai_addrlen);
+        if (connectRc == 0)
+        {
+            setSocketBlocking(sock, true);
+            break;
+        }
+
+        if (errno != EINPROGRESS)
+        {
+            close(sock);
+            sock = -1;
+            continue;
+        }
+
+        fd_set writeSet;
+        FD_ZERO(&writeSet);
+        FD_SET(sock, &writeSet);
+
+        timeval timeout{};
+        timeout.tv_sec = timeoutMs / 1000;
+        timeout.tv_usec = (timeoutMs % 1000) * 1000;
+
+        int selectRc = select(sock + 1, nullptr, &writeSet, nullptr, &timeout);
+        if (selectRc > 0)
+        {
+            int error = 0;
+            socklen_t errorLen = sizeof(error);
+            if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &error, &errorLen) == 0 && error == 0)
+            {
+                setSocketBlocking(sock, true);
+                break;
+            }
+        }
+
+        close(sock);
+        sock = -1;
+    }
+
+    freeaddrinfo(results);
+    return sock;
+}
+
+bool requestWitnessLine(const std::string &host, int port, const std::string &request, std::string &replyLine)
+{
+    int sock = connectToHostWithTimeout(host, port, kWitnessTimeoutMs);
+    if (sock < 0)
+        return false;
+
+    timeval timeout{};
+    timeout.tv_sec = 0;
+    timeout.tv_usec = kWitnessTimeoutMs * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+
+    std::string wire = request + "\n";
+    if (send(sock, wire.c_str(), wire.size(), 0) <= 0)
+    {
+        close(sock);
+        return false;
+    }
+
+    char buffer[256];
+    std::string response;
+    while (true)
+    {
+        int bytes = recv(sock, buffer, sizeof(buffer), 0);
+        if (bytes <= 0)
+            break;
+
+        response.append(buffer, bytes);
+        size_t newline = response.find('\n');
+        if (newline != std::string::npos)
+        {
+            replyLine = response.substr(0, newline);
+            if (!replyLine.empty() && replyLine.back() == '\r')
+                replyLine.pop_back();
+            close(sock);
+            return true;
+        }
+    }
+
+    close(sock);
+    return false;
+}
+
+WitnessReply parseWitnessReply(const std::string &line)
+{
+    WitnessReply reply;
+    std::vector<std::string> parts = protocolSplit(line, '|');
+    if (parts.size() < 4)
+        return reply;
+
+    if (parts[0] != "OK" && parts[0] != "DENY" && parts[0] != "PONG")
+        return reply;
+
+    reply.reachable = true;
+    reply.granted = parts[0] == "OK";
+    reply.epoch = static_cast<std::uint64_t>(std::stoull(parts[1]));
+    reply.owner = protocolUnescape(parts[2]);
+    reply.ttlMs = std::atoi(parts[3].c_str());
+    return reply;
+}
+
+WitnessReply acquireWitnessLease(const std::string &host, int port,
+                                 const std::string &ownerId, std::uint64_t requestedEpoch)
+{
+    std::string replyLine;
+    std::ostringstream request;
+    request << "ACQUIRE|" << protocolEscape(ownerId) << "|" << requestedEpoch << "|" << kWitnessLeaseMs;
+    if (!requestWitnessLine(host, port, request.str(), replyLine))
+        return WitnessReply{};
+    return parseWitnessReply(replyLine);
+}
+
+WitnessReply renewWitnessLease(const std::string &host, int port,
+                               const std::string &ownerId, std::uint64_t epoch)
+{
+    std::string replyLine;
+    std::ostringstream request;
+    request << "RENEW|" << protocolEscape(ownerId) << "|" << epoch << "|" << kWitnessLeaseMs;
+    if (!requestWitnessLine(host, port, request.str(), replyLine))
+        return WitnessReply{};
+    return parseWitnessReply(replyLine);
+}
+
+WitnessReply pingWitness(const std::string &host, int port)
+{
+    std::string replyLine;
+    if (!requestWitnessLine(host, port, "PING", replyLine))
+        return WitnessReply{};
+    return parseWitnessReply(replyLine);
+}
+
+int secondsRemainingFromTicks(int ticksRemaining)
+{
+    if (ticksRemaining <= 0)
         return 0;
 
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - now).count();
-    return static_cast<int>((ms + 999) / 1000);
+    int msRemaining = ticksRemaining * kServerTickMs;
+    return (msRemaining + 999) / 1000;
 }
 
-class TronGame
+class ReplicaNode
 {
 private:
-    std::vector<std::vector<char>> grid;
-    std::unordered_map<int, Player> players;
-    std::unordered_set<int> spectators;
     std::mutex mtx;
-    int nextId = 1;
-    GamePhase phase = GamePhase::Waiting;
-    std::chrono::steady_clock::time_point countdownStart{};
-    std::chrono::steady_clock::time_point countdownEnd{};
-    std::chrono::steady_clock::time_point matchEnd{};
+    std::unordered_map<std::string, MirroredPlayer> playersByClientId;
+    std::unordered_set<std::string> spectatorsByName;
+    std::unordered_map<int, std::string> connectionNames;
+    std::unordered_map<int, std::string> connectionClientIds;
+    std::vector<std::string> gridRows;
+    std::unordered_map<std::uint64_t, std::unordered_map<std::string, ReplicatedInput>> pendingInputs;
+    std::uint64_t epoch = 1;
+    std::uint64_t currentTick = 0;
+    std::uint64_t publishedTick = 0;
+    std::uint64_t safeTick = 0;
+    std::string phase = "WAITING";
+    int countdownTicksRemaining = 0;
+    int countdownTicksElapsed = 0;
+    int matchTicksRemaining = 0;
     char winnerSymbol = '\0';
     std::string winnerName;
+    bool authoritative = false;
+    bool checkpointLoaded = false;
+    bool replayHealthy = false;
+    bool witnessAvailable = true;
+    bool checkpointRequested = true;
+    int nextPlayerId = 1;
+    std::string lastStateHash;
+    std::chrono::steady_clock::time_point lastPrimaryHeartbeat = std::chrono::steady_clock::now();
 
     void resetGridLocked()
     {
-        grid.assign(HEIGHT, std::vector<char>(WIDTH, '.'));
+        gridRows.assign(HEIGHT, std::string(WIDTH, '.'));
 
         for (int x = 0; x < WIDTH; x++)
         {
-            grid[0][x] = '#';
-            grid[HEIGHT - 1][x] = '#';
+            gridRows[0][x] = '#';
+            gridRows[HEIGHT - 1][x] = '#';
         }
 
         for (int y = 0; y < HEIGHT; y++)
         {
-            grid[y][0] = '#';
-            grid[y][WIDTH - 1] = '#';
+            gridRows[y][0] = '#';
+            gridRows[y][WIDTH - 1] = '#';
         }
+    }
+
+    int alivePlayersLocked() const
+    {
+        int count = 0;
+        for (const auto &entry : playersByClientId)
+        {
+            if (entry.second.alive)
+                count++;
+        }
+        return count;
     }
 
     bool spawnTakenLocked(int x, int y) const
     {
-        for (const auto &entry : players)
+        for (const auto &entry : playersByClientId)
         {
-            const Player &p = entry.second;
-            if (p.spawnX == x && p.spawnY == y)
+            const MirroredPlayer &player = entry.second;
+            if (player.spawnX == x && player.spawnY == y)
                 return true;
         }
         return false;
     }
 
-    bool assignSpawnLocked(Player &player)
+    bool assignSpawnLocked(MirroredPlayer &player)
     {
         for (int tries = 0; tries < 500; tries++)
         {
             int x = distX(rng);
             int y = distY(rng);
-
             if (spawnTakenLocked(x, y))
                 continue;
 
@@ -152,153 +337,357 @@ private:
         return false;
     }
 
-    int alivePlayersLocked() const
-    {
-        int count = 0;
-        for (const auto &entry : players)
-        {
-            if (entry.second.alive)
-                count++;
-        }
-        return count;
-    }
-
     void redrawWaitingSpawnsLocked()
     {
         resetGridLocked();
-        for (const auto &entry : players)
+        for (const auto &entry : playersByClientId)
         {
-            const Player &p = entry.second;
-            if (p.spawnY >= 0 && p.spawnY < HEIGHT && p.spawnX >= 0 && p.spawnX < WIDTH)
-                grid[p.spawnY][p.spawnX] = p.symbol;
+            const MirroredPlayer &player = entry.second;
+            if (player.spawnY >= 0 && player.spawnY < HEIGHT &&
+                player.spawnX >= 0 && player.spawnX < WIDTH)
+            {
+                gridRows[player.spawnY][player.spawnX] = player.symbol;
+            }
         }
     }
 
-    void startCountdownLocked(const std::chrono::steady_clock::time_point &now)
+    void startCountdownLocked(std::vector<std::string> *events = nullptr)
     {
-        phase = GamePhase::Countdown;
+        phase = "COUNTDOWN";
         winnerSymbol = '\0';
         winnerName.clear();
-        countdownStart = now;
-        countdownEnd = now + std::chrono::seconds(kCountdownSeconds);
+        countdownTicksRemaining = kCountdownTicks;
+        countdownTicksElapsed = 0;
+        checkpointRequested = true;
+        if (events != nullptr)
+            events->push_back("COUNTDOWN_STARTED");
     }
 
-    void startMatchLocked(const std::chrono::steady_clock::time_point &now)
+    void startMatchLocked(std::vector<std::string> *events = nullptr)
     {
         resetGridLocked();
 
-        for (auto &entry : players)
+        for (auto &entry : playersByClientId)
         {
-            Player &p = entry.second;
-            p.alive = true;
-            p.dir = "RIGHT";
-            p.x = p.spawnX;
-            p.y = p.spawnY;
-            grid[p.y][p.x] = p.symbol;
+            MirroredPlayer &player = entry.second;
+            player.alive = true;
+            player.dir = "RIGHT";
+            player.x = player.spawnX;
+            player.y = player.spawnY;
+            gridRows[player.y][player.x] = player.symbol;
         }
 
-        phase = GamePhase::InProgress;
-        matchEnd = now + std::chrono::seconds(kMatchDurationSeconds);
+        phase = "IN_PROGRESS";
+        matchTicksRemaining = kMatchDurationTicks;
         winnerSymbol = '\0';
         winnerName.clear();
+        checkpointRequested = true;
+        if (events != nullptr)
+            events->push_back("MATCH_STARTED");
     }
 
-    void finishMatchLocked()
+    void finishMatchLocked(std::vector<std::string> *events = nullptr)
     {
-        phase = GamePhase::Finished;
+        phase = "FINISHED";
         winnerSymbol = '\0';
         winnerName.clear();
 
         int aliveCount = 0;
-        char lastAlive = '\0';
+        char lastAliveSymbol = '\0';
         std::string lastAliveName;
-
-        for (const auto &entry : players)
+        for (const auto &entry : playersByClientId)
         {
-            const Player &p = entry.second;
-            if (p.alive)
-            {
-                aliveCount++;
-                lastAlive = p.symbol;
-                lastAliveName = p.name;
-            }
+            const MirroredPlayer &player = entry.second;
+            if (!player.alive)
+                continue;
+
+            aliveCount++;
+            lastAliveSymbol = player.symbol;
+            lastAliveName = player.name;
         }
 
         if (aliveCount == 1)
         {
-            winnerSymbol = lastAlive;
+            winnerSymbol = lastAliveSymbol;
             winnerName = lastAliveName;
         }
+
+        checkpointRequested = true;
+        if (events != nullptr)
+            events->push_back("MATCH_FINISHED");
     }
 
-    std::string renderGridForClientLocked(int socket,
-                                          const std::chrono::steady_clock::time_point &now) const
+    ReplicationCheckpoint buildCheckpointLocked() const
     {
-        std::vector<std::string> rows(HEIGHT, std::string(WIDTH, '.'));
-        for (int y = 0; y < HEIGHT; y++)
+        ReplicationCheckpoint checkpoint;
+        checkpoint.epoch = epoch;
+        checkpoint.tick = currentTick;
+        checkpoint.publishedTick = publishedTick;
+        checkpoint.safeTick = safeTick;
+        checkpoint.phase = phase;
+        checkpoint.countdownTicksRemaining = countdownTicksRemaining;
+        checkpoint.matchTicksRemaining = matchTicksRemaining;
+        checkpoint.winnerName = winnerName;
+        checkpoint.winnerSymbol = winnerSymbol;
+        checkpoint.gridRows = gridRows;
+
+        for (const auto &entry : playersByClientId)
         {
-            for (int x = 0; x < WIDTH; x++)
-                rows[y][x] = grid[y][x];
+            const MirroredPlayer &player = entry.second;
+            ReplicatedPlayerState replicated;
+            replicated.clientId = player.clientId;
+            replicated.name = player.name;
+            replicated.symbol = player.symbol;
+            replicated.x = player.x;
+            replicated.y = player.y;
+            replicated.spawnX = player.spawnX;
+            replicated.spawnY = player.spawnY;
+            replicated.dir = player.dir;
+            replicated.alive = player.alive;
+            checkpoint.players.push_back(replicated);
         }
 
-        if (phase == GamePhase::Countdown)
+        for (const std::string &spectator : spectatorsByName)
+            checkpoint.spectators.push_back(spectator);
+
+        checkpoint.stateHash = computeStateHash(checkpoint);
+        return checkpoint;
+    }
+
+    std::vector<ReplicatedInput> collectAcceptedInputsLocked(std::uint64_t targetTick)
+    {
+        std::vector<ReplicatedInput> accepted;
+
+        for (auto it = pendingInputs.begin(); it != pendingInputs.end();)
         {
-            auto playerIt = players.find(socket);
-            if (playerIt != players.end())
+            if (it->first < targetTick)
+                it = pendingInputs.erase(it);
+            else
+                ++it;
+        }
+
+        auto tickIt = pendingInputs.find(targetTick);
+        if (tickIt == pendingInputs.end())
+            return accepted;
+
+        for (const auto &entry : tickIt->second)
+            accepted.push_back(entry.second);
+
+        std::sort(accepted.begin(), accepted.end(), [](const ReplicatedInput &a, const ReplicatedInput &b)
+                  {
+                      if (a.clientId != b.clientId)
+                          return a.clientId < b.clientId;
+                      return a.clientSeq < b.clientSeq;
+                  });
+        pendingInputs.erase(tickIt);
+        return accepted;
+    }
+
+    void applyAcceptedInputsLocked(const std::vector<ReplicatedInput> &inputs, std::vector<std::string> &events)
+    {
+        for (const ReplicatedInput &input : inputs)
+        {
+            if (input.command == "START")
             {
-                const Player &p = playerIt->second;
-                auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - countdownStart).count();
-                bool visible = ((elapsedMs / 250) % 2) == 0;
-                if (!visible && p.spawnY >= 0 && p.spawnY < HEIGHT && p.spawnX >= 0 && p.spawnX < WIDTH)
-                    rows[p.spawnY][p.spawnX] = '.';
+                bool connected = false;
+                for (const auto &entry : connectionClientIds)
+                {
+                    if (entry.second == input.clientId)
+                    {
+                        connected = true;
+                        break;
+                    }
+                }
+
+                if (!connected || playersByClientId.size() < kMinimumPlayersToStart)
+                    continue;
+
+                if (phase == "WAITING" || phase == "FINISHED")
+                {
+                    redrawWaitingSpawnsLocked();
+                    startCountdownLocked(&events);
+                }
+                continue;
+            }
+
+            auto it = playersByClientId.find(input.clientId);
+            if (it == playersByClientId.end())
+                continue;
+
+            if (phase != "IN_PROGRESS")
+                continue;
+
+            MirroredPlayer &player = it->second;
+            if (!player.alive)
+                continue;
+
+            if ((input.command == "UP" && player.dir == "DOWN") ||
+                (input.command == "DOWN" && player.dir == "UP") ||
+                (input.command == "LEFT" && player.dir == "RIGHT") ||
+                (input.command == "RIGHT" && player.dir == "LEFT"))
+                continue;
+
+            if (input.command == "UP" || input.command == "DOWN" ||
+                input.command == "LEFT" || input.command == "RIGHT")
+            {
+                player.dir = input.command;
             }
         }
-
-        std::string out;
-        out.reserve((WIDTH + 1) * HEIGHT);
-        for (int y = 0; y < HEIGHT; y++)
-        {
-            out += rows[y];
-            out += '\n';
-        }
-        return out;
     }
 
-    std::string statusTextLocked(bool isPlayer, bool alive, char playerSymbol,
-                                 const std::string &playerName,
-                                 int remainingSeconds) const
+    void advanceOneTickLocked(const std::vector<ReplicatedInput> &acceptedInputs,
+                              std::uint64_t targetTick,
+                              std::vector<std::string> &events)
     {
-        if (phase == GamePhase::Waiting)
+        currentTick = targetTick;
+        applyAcceptedInputsLocked(acceptedInputs, events);
+
+        if (phase == "WAITING")
         {
-            if (isPlayer)
-                return "LOBBY | Press R to start. Need at least " +
-                       std::to_string(kMinimumPlayersToStart) + " player(s).";
-            return "SPECTATING | Press R to start. Need at least " +
-                   std::to_string(kMinimumPlayersToStart) + " player(s).";
+            publishedTick = currentTick;
+            if (authoritative)
+                safeTick = currentTick;
+            return;
         }
 
-        if (phase == GamePhase::Countdown)
+        if (phase == "COUNTDOWN")
         {
+            if (playersByClientId.size() < kMinimumPlayersToStart)
+            {
+                phase = "WAITING";
+                winnerSymbol = '\0';
+                winnerName.clear();
+                redrawWaitingSpawnsLocked();
+                checkpointRequested = true;
+                events.push_back("COUNTDOWN_CANCELLED");
+            }
+            else
+            {
+                countdownTicksElapsed++;
+                if (countdownTicksRemaining > 0)
+                    countdownTicksRemaining--;
+
+                if (countdownTicksRemaining <= 0)
+                    startMatchLocked(&events);
+            }
+
+            publishedTick = currentTick;
+            if (authoritative)
+                safeTick = currentTick;
+            return;
+        }
+
+        if (phase == "IN_PROGRESS")
+        {
+            for (auto &entry : playersByClientId)
+            {
+                MirroredPlayer &player = entry.second;
+                if (!player.alive)
+                    continue;
+                gridRows[player.y][player.x] = '#';
+            }
+
+            for (auto &entry : playersByClientId)
+            {
+                MirroredPlayer &player = entry.second;
+                if (!player.alive)
+                    continue;
+
+                int nextX = player.x;
+                int nextY = player.y;
+
+                if (player.dir == "UP")
+                    nextY--;
+                else if (player.dir == "DOWN")
+                    nextY++;
+                else if (player.dir == "LEFT")
+                    nextX--;
+                else if (player.dir == "RIGHT")
+                    nextX++;
+
+                if (nextX < 0 || nextX >= WIDTH || nextY < 0 || nextY >= HEIGHT ||
+                    gridRows[nextY][nextX] != '.')
+                {
+                    player.alive = false;
+                    continue;
+                }
+
+                player.x = nextX;
+                player.y = nextY;
+                gridRows[player.y][player.x] = player.symbol;
+            }
+
+            if (matchTicksRemaining > 0)
+                matchTicksRemaining--;
+
+            if (alivePlayersLocked() <= 1 || matchTicksRemaining <= 0)
+                finishMatchLocked(&events);
+
+            publishedTick = currentTick;
+            if (authoritative)
+                safeTick = currentTick;
+            return;
+        }
+
+        publishedTick = currentTick;
+        if (authoritative)
+            safeTick = currentTick;
+    }
+
+    std::string statusTextLocked(int socket) const
+    {
+        std::string clientId;
+        auto connectionIt = connectionClientIds.find(socket);
+        if (connectionIt != connectionClientIds.end())
+            clientId = connectionIt->second;
+
+        auto playerIt = playersByClientId.find(clientId);
+        bool isPlayer = playerIt != playersByClientId.end();
+        bool alive = isPlayer && playerIt->second.alive;
+        char playerSymbol = isPlayer ? playerIt->second.symbol : '\0';
+
+        if (phase == "WAITING")
+        {
+            if (authoritative)
+            {
+                if (isPlayer)
+                    return "LOBBY | Press R to start. Need at least " + std::to_string(kMinimumPlayersToStart) + " player(s).";
+                return "SPECTATING | Press R to start. Need at least " + std::to_string(kMinimumPlayersToStart) + " player(s).";
+            }
+
             if (isPlayer)
-                return "COUNTDOWN | Match starts in " + std::to_string(remainingSeconds) +
-                       "s. Your spawn is flashing.";
+                return "LOBBY | Standby replica synced with primary.";
+            return "SPECTATING | Standby replica synced with primary.";
+        }
+
+        if (phase == "COUNTDOWN")
+        {
+            int remainingSeconds = secondsRemainingFromTicks(countdownTicksRemaining);
+            if (isPlayer)
+                return "COUNTDOWN | Match starts in " + std::to_string(remainingSeconds) + "s. Your spawn is flashing.";
             return "SPECTATING | Countdown: " + std::to_string(remainingSeconds) + "s.";
         }
 
-        if (phase == GamePhase::InProgress)
+        if (phase == "IN_PROGRESS")
         {
+            int remainingSeconds = secondsRemainingFromTicks(matchTicksRemaining);
             if (isPlayer && alive)
             {
-                return "ALIVE | Time remaining: " + std::to_string(remainingSeconds) + "s.";
+                if (authoritative)
+                    return "ALIVE | Time remaining: " + std::to_string(remainingSeconds) + "s.";
+                return "ALIVE | Standby replica view. Time remaining: " + std::to_string(remainingSeconds) + "s.";
             }
 
             if (isPlayer && !alive)
             {
-                return "DEAD | Now spectating. Time remaining: " +
-                       std::to_string(remainingSeconds) + "s.";
+                if (authoritative)
+                    return "DEAD | Now spectating. Time remaining: " + std::to_string(remainingSeconds) + "s.";
+                return "DEAD | Standby replica view. Time remaining: " + std::to_string(remainingSeconds) + "s.";
             }
 
-            return "SPECTATING | Time remaining: " + std::to_string(remainingSeconds) + "s.";
+            if (authoritative)
+                return "SPECTATING | Time remaining: " + std::to_string(remainingSeconds) + "s.";
+            return "SPECTATING | Standby replica view. Time remaining: " + std::to_string(remainingSeconds) + "s.";
         }
 
         if (winnerName.empty())
@@ -314,245 +703,390 @@ private:
     }
 
 public:
-    TronGame()
+    ReplicaNode()
+        : gridRows(HEIGHT, std::string(WIDTH, '.'))
     {
         resetGridLocked();
     }
 
-    bool registerConnection(int socket, std::string &note)
+    bool isAuthoritative()
     {
         std::lock_guard<std::mutex> lock(mtx);
+        return authoritative;
+    }
 
-        if (phase == GamePhase::Waiting)
-        {
-            Player player;
-            player.id = nextId++;
-            player.socket = socket;
-            player.alive = true;
-            player.dir = "RIGHT";
-            player.symbol = static_cast<char>('A' + ((player.id - 1) % 26));
-            player.name = "Player " + std::string(1, player.symbol);
+    std::uint64_t getEpoch()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        return epoch;
+    }
 
-            if (!assignSpawnLocked(player))
-            {
-                spectators.insert(socket);
-                note = "joined as spectator (no free spawn available)";
-                return false;
-            }
+    std::uint64_t nextPromotionEpoch()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        return epoch + 1;
+    }
 
-            players[socket] = player;
-            grid[player.spawnY][player.spawnX] = player.symbol;
-            note = "joined as player " + std::string(1, player.symbol);
+    std::uint64_t getSafeTick()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        return safeTick;
+    }
 
-            return true;
-        }
+    std::string getLastStateHash()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        return lastStateHash;
+    }
 
-        spectators.insert(socket);
-        if (phase == GamePhase::Countdown)
-            note = "joined as spectator (match countdown already started)";
-        else if (phase == GamePhase::InProgress)
-            note = "joined as spectator (mid-match join blocked)";
-        else
-            note = "joined as spectator (match already finished)";
+    bool witnessIsAvailable()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        return witnessAvailable;
+    }
 
-        return false;
+    void setWitnessAvailable(bool available)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        witnessAvailable = available;
+    }
+
+    long long millisecondsSincePrimaryHeartbeat()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        auto delta = std::chrono::steady_clock::now() - lastPrimaryHeartbeat;
+        return std::chrono::duration_cast<std::chrono::milliseconds>(delta).count();
+    }
+
+    bool canPromote()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        return !authoritative && checkpointLoaded && replayHealthy && witnessAvailable;
+    }
+
+    void promoteToLeader(std::uint64_t newEpoch)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        authoritative = true;
+        epoch = newEpoch;
+        currentTick = safeTick;
+        publishedTick = safeTick;
+        checkpointRequested = true;
+        replayHealthy = true;
+        std::cout << "Replica promoted to leader for epoch " << epoch
+                  << " from safe_tick " << safeTick << ".\n";
+    }
+
+    void registerConnection(int socket, std::string &note)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        connectionNames[socket] = "";
+        connectionClientIds[socket] = "socket-" + std::to_string(socket);
+        note = authoritative ? "connected to promoted replica leader" : "connected to standby replica";
     }
 
     void removeConnection(int socket)
     {
         std::lock_guard<std::mutex> lock(mtx);
-        bool foundConnection = false;
 
-        auto playerIt = players.find(socket);
-        if (playerIt != players.end())
+        std::string clientId;
+        auto clientIt = connectionClientIds.find(socket);
+        if (clientIt != connectionClientIds.end())
         {
-            foundConnection = true;
-            const Player &p = playerIt->second;
-            if (p.y >= 0 && p.y < HEIGHT && p.x >= 0 && p.x < WIDTH)
-            {
-                if (phase == GamePhase::InProgress && p.alive)
-                    grid[p.y][p.x] = '#';
-                else
-                    grid[p.y][p.x] = '.';
-            }
-            players.erase(playerIt);
+            clientId = clientIt->second;
+            connectionClientIds.erase(clientIt);
         }
 
-        if (spectators.erase(socket) > 0)
-            foundConnection = true;
+        connectionNames.erase(socket);
 
-        if (phase == GamePhase::Countdown && players.size() < kMinimumPlayersToStart)
+        if (authoritative && !clientId.empty())
         {
-            phase = GamePhase::Waiting;
-            winnerSymbol = '\0';
-            winnerName.clear();
-            redrawWaitingSpawnsLocked();
-        }
-
-        if (phase == GamePhase::InProgress && alivePlayersLocked() <= 1)
-            finishMatchLocked();
-
-        if (phase == GamePhase::Finished && players.empty())
-        {
-            phase = GamePhase::Waiting;
-            winnerSymbol = '\0';
-            winnerName.clear();
-            resetGridLocked();
-        }
-
-        if (foundConnection)
-            close(socket);
-    }
-
-    void changeDirection(int socket, const std::string &dir)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-
-        auto it = players.find(socket);
-        if (it == players.end())
-            return;
-
-        if (phase != GamePhase::InProgress)
-            return;
-
-        Player &p = it->second;
-        if (!p.alive)
-            return;
-
-        if ((dir == "UP" && p.dir == "DOWN") ||
-            (dir == "DOWN" && p.dir == "UP") ||
-            (dir == "LEFT" && p.dir == "RIGHT") ||
-            (dir == "RIGHT" && p.dir == "LEFT"))
-            return;
-
-        p.dir = dir;
-    }
-
-    void requestStart(int socket)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-
-        bool isConnected = players.find(socket) != players.end() ||
-                           spectators.find(socket) != spectators.end();
-        if (!isConnected)
-            return;
-
-        if (players.size() < kMinimumPlayersToStart)
-            return;
-
-        if (phase != GamePhase::Waiting && phase != GamePhase::Finished)
-            return;
-
-        redrawWaitingSpawnsLocked();
-        startCountdownLocked(std::chrono::steady_clock::now());
-    }
-
-    void setPlayerName(int socket, const std::string &requestedName)
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto it = players.find(socket);
-        if (it == players.end())
-            return;
-
-        std::string sanitized = sanitizePlayerName(requestedName);
-        if (sanitized.empty())
-            return;
-
-        it->second.name = sanitized;
-    }
-
-    void update()
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        auto now = std::chrono::steady_clock::now();
-
-        if (phase == GamePhase::Waiting)
-            return;
-
-        if (phase == GamePhase::Countdown)
-        {
-            if (players.size() < kMinimumPlayersToStart)
+            auto playerIt = playersByClientId.find(clientId);
+            if (playerIt != playersByClientId.end())
             {
-                phase = GamePhase::Waiting;
-                winnerSymbol = '\0';
-                winnerName.clear();
-                redrawWaitingSpawnsLocked();
-                return;
-            }
-
-            if (now >= countdownEnd)
-                startMatchLocked(now);
-
-            return;
-        }
-
-        if (phase == GamePhase::InProgress)
-        {
-            for (auto &entry : players)
-            {
-                Player &p = entry.second;
-                if (!p.alive)
-                    continue;
-                grid[p.y][p.x] = '#';
-            }
-
-            for (auto &entry : players)
-            {
-                Player &p = entry.second;
-                if (!p.alive)
-                    continue;
-
-                int nextX = p.x;
-                int nextY = p.y;
-
-                if (p.dir == "UP")
-                    nextY--;
-                else if (p.dir == "DOWN")
-                    nextY++;
-                else if (p.dir == "LEFT")
-                    nextX--;
-                else if (p.dir == "RIGHT")
-                    nextX++;
-
-                if (nextX < 0 || nextX >= WIDTH || nextY < 0 || nextY >= HEIGHT ||
-                    grid[nextY][nextX] != '.')
+                MirroredPlayer player = playerIt->second;
+                if (phase == "IN_PROGRESS" && player.alive &&
+                    player.y >= 0 && player.y < HEIGHT &&
+                    player.x >= 0 && player.x < WIDTH)
                 {
-                    p.alive = false;
-                    continue;
+                    gridRows[player.y][player.x] = '#';
+                }
+                else if (player.y >= 0 && player.y < HEIGHT &&
+                         player.x >= 0 && player.x < WIDTH)
+                {
+                    gridRows[player.y][player.x] = '.';
                 }
 
-                p.x = nextX;
-                p.y = nextY;
-                grid[p.y][p.x] = p.symbol;
+                playersByClientId.erase(playerIt);
+                checkpointRequested = true;
             }
 
-            if (alivePlayersLocked() <= 1 || now >= matchEnd)
-                finishMatchLocked();
+            if (phase == "COUNTDOWN" && playersByClientId.size() < kMinimumPlayersToStart)
+            {
+                phase = "WAITING";
+                winnerName.clear();
+                winnerSymbol = '\0';
+                redrawWaitingSpawnsLocked();
+            }
 
+            if (phase == "IN_PROGRESS" && alivePlayersLocked() <= 1)
+            {
+                std::vector<std::string> events;
+                finishMatchLocked(&events);
+            }
+
+            if (phase == "FINISHED" && playersByClientId.empty())
+            {
+                phase = "WAITING";
+                winnerName.clear();
+                winnerSymbol = '\0';
+                resetGridLocked();
+            }
+        }
+
+        close(socket);
+    }
+
+    void setViewerIdentity(int socket, const std::string &clientId, const std::string &requestedName)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        std::string sanitizedId = sanitizePlayerName(clientId);
+        std::string sanitizedName = sanitizePlayerName(requestedName);
+        if (sanitizedId.empty())
+            return;
+        if (sanitizedName.empty())
+            sanitizedName = "Player";
+
+        connectionClientIds[socket] = sanitizedId;
+        connectionNames[socket] = sanitizedName;
+
+        if (!authoritative)
+            return;
+
+        auto playerIt = playersByClientId.find(sanitizedId);
+        if (playerIt != playersByClientId.end())
+        {
+            playerIt->second.name = sanitizedName;
+            checkpointRequested = true;
             return;
         }
+
+        if (phase != "WAITING")
+        {
+            spectatorsByName.insert(sanitizedName);
+            return;
+        }
+
+        MirroredPlayer player;
+        player.clientId = sanitizedId;
+        player.name = sanitizedName;
+        player.symbol = static_cast<char>('A' + ((nextPlayerId - 1) % 26));
+        nextPlayerId++;
+
+        if (!assignSpawnLocked(player))
+        {
+            spectatorsByName.insert(sanitizedName);
+            return;
+        }
+
+        playersByClientId[sanitizedId] = player;
+        gridRows[player.spawnY][player.spawnX] = player.symbol;
+        checkpointRequested = true;
+    }
+
+    bool queueMirroredInput(int socket, const ReplicatedInput &input)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+
+        auto connectionIt = connectionClientIds.find(socket);
+        if (connectionIt == connectionClientIds.end())
+            return false;
+
+        if (connectionIt->second != input.clientId)
+            return false;
+
+        if (input.targetTick <= currentTick)
+            return false;
+
+        if (input.epochHint > epoch && !authoritative)
+            return false;
+
+        auto &slot = pendingInputs[input.targetTick][input.clientId];
+        if (slot.clientSeq > input.clientSeq)
+            return false;
+
+        slot = input;
+        return true;
+    }
+
+    void applyHeartbeat(const HeartbeatMessage &heartbeat)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (authoritative)
+            return;
+
+        if (heartbeat.epoch > epoch)
+            epoch = heartbeat.epoch;
+        if (heartbeat.publishedTick > publishedTick)
+            publishedTick = heartbeat.publishedTick;
+        lastPrimaryHeartbeat = std::chrono::steady_clock::now();
+    }
+
+    bool applyCheckpoint(const ReplicationCheckpoint &checkpoint, SafeTickReport &report)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (authoritative)
+            return false;
+
+        epoch = checkpoint.epoch;
+        currentTick = checkpoint.tick;
+        publishedTick = checkpoint.publishedTick;
+        safeTick = checkpoint.tick;
+        phase = checkpoint.phase;
+        countdownTicksRemaining = checkpoint.countdownTicksRemaining;
+        countdownTicksElapsed = 0;
+        matchTicksRemaining = checkpoint.matchTicksRemaining;
+        winnerSymbol = checkpoint.winnerSymbol;
+        winnerName = checkpoint.winnerName;
+        lastPrimaryHeartbeat = std::chrono::steady_clock::now();
+        witnessAvailable = true;
+
+        playersByClientId.clear();
+        for (const ReplicatedPlayerState &player : checkpoint.players)
+        {
+            MirroredPlayer mirrored;
+            mirrored.clientId = player.clientId;
+            mirrored.name = player.name;
+            mirrored.symbol = player.symbol;
+            mirrored.x = player.x;
+            mirrored.y = player.y;
+            mirrored.spawnX = player.spawnX;
+            mirrored.spawnY = player.spawnY;
+            mirrored.dir = player.dir;
+            mirrored.alive = player.alive;
+            playersByClientId[mirrored.clientId] = mirrored;
+        }
+
+        nextPlayerId = static_cast<int>(playersByClientId.size()) + 1;
+
+        spectatorsByName.clear();
+        for (const std::string &spectator : checkpoint.spectators)
+            spectatorsByName.insert(spectator);
+
+        if (checkpoint.gridRows.size() == static_cast<size_t>(HEIGHT))
+            gridRows = checkpoint.gridRows;
+        else
+            resetGridLocked();
+
+        lastStateHash = checkpoint.stateHash.empty() ? computeStateHash(checkpoint) : checkpoint.stateHash;
+        checkpointLoaded = true;
+        replayHealthy = true;
+
+        report.epoch = epoch;
+        report.safeTick = safeTick;
+        report.stateHash = lastStateHash;
+        return true;
+    }
+
+    bool applyTickSeal(const TickSeal &seal, SafeTickReport &report)
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (authoritative || !checkpointLoaded || !replayHealthy)
+            return false;
+
+        if (seal.epoch < epoch || seal.tick <= safeTick)
+            return false;
+
+        if (seal.tick != currentTick + 1)
+        {
+            replayHealthy = false;
+            return false;
+        }
+
+        std::vector<std::string> events;
+        advanceOneTickLocked(seal.acceptedInputs, seal.tick, events);
+
+        ReplicationCheckpoint checkpoint = buildCheckpointLocked();
+        std::string localHash = checkpoint.stateHash;
+        if (localHash != seal.stateHash)
+        {
+            replayHealthy = false;
+            return false;
+        }
+
+        epoch = seal.epoch;
+        safeTick = seal.tick;
+        lastStateHash = localHash;
+        report.epoch = epoch;
+        report.safeTick = safeTick;
+        report.stateHash = lastStateHash;
+        return true;
+    }
+
+    void leaderTick()
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        if (!authoritative)
+            return;
+
+        std::uint64_t nextTick = currentTick + 1;
+        std::vector<ReplicatedInput> acceptedInputs = collectAcceptedInputsLocked(nextTick);
+        std::vector<std::string> events;
+        advanceOneTickLocked(acceptedInputs, nextTick, events);
+        ReplicationCheckpoint checkpoint = buildCheckpointLocked();
+        lastStateHash = checkpoint.stateHash;
     }
 
     std::string buildFrameForClient(int socket)
     {
         std::lock_guard<std::mutex> lock(mtx);
-        auto now = std::chrono::steady_clock::now();
 
-        auto playerIt = players.find(socket);
-        bool isPlayer = playerIt != players.end();
+        std::string clientId;
+        auto clientIt = connectionClientIds.find(socket);
+        if (clientIt != connectionClientIds.end())
+            clientId = clientIt->second;
+
+        auto playerIt = playersByClientId.find(clientId);
+        bool isPlayer = playerIt != playersByClientId.end();
         bool alive = isPlayer && playerIt->second.alive;
         char playerSymbol = isPlayer ? playerIt->second.symbol : '\0';
-        std::string playerName = isPlayer ? playerIt->second.name : "NONE";
+        std::string playerName = "NONE";
+        if (isPlayer)
+            playerName = playerIt->second.name;
+        else
+        {
+            auto nameIt = connectionNames.find(socket);
+            if (nameIt != connectionNames.end() && !nameIt->second.empty())
+                playerName = nameIt->second;
+        }
 
         int remaining = 0;
-        if (phase == GamePhase::Countdown)
-            remaining = secondsRemaining(countdownEnd, now);
-        else if (phase == GamePhase::InProgress)
-            remaining = secondsRemaining(matchEnd, now);
+        if (phase == "COUNTDOWN")
+            remaining = secondsRemainingFromTicks(countdownTicksRemaining);
+        else if (phase == "IN_PROGRESS")
+            remaining = secondsRemainingFromTicks(matchTicksRemaining);
+
+        std::vector<std::string> renderedRows = gridRows;
+        if (phase == "COUNTDOWN" && isPlayer)
+        {
+            const MirroredPlayer &player = playerIt->second;
+            bool visible = ((countdownTicksElapsed / 2) % 2) == 0;
+            if (!visible &&
+                player.spawnY >= 0 && player.spawnY < static_cast<int>(renderedRows.size()) &&
+                player.spawnX >= 0 && player.spawnX < static_cast<int>(renderedRows[player.spawnY].size()))
+            {
+                renderedRows[player.spawnY][player.spawnX] = '.';
+            }
+        }
 
         std::ostringstream out;
         out << "META\n";
-        out << "phase=" << phaseToString(phase) << "\n";
+        out << "epoch=" << epoch << "\n";
+        out << "tick=" << currentTick << "\n";
+        out << "published_tick=" << publishedTick << "\n";
+        out << "safe_tick=" << safeTick << "\n";
+        out << "authoritative=" << (authoritative ? 1 : 0) << "\n";
+        out << "phase=" << phase << "\n";
         out << "role=" << (isPlayer ? "PLAYER" : "SPECTATOR") << "\n";
         out << "alive=" << (alive ? 1 : 0) << "\n";
         out << "winner=" << (winnerName.empty() ? "NONE" : winnerName) << "\n";
@@ -560,110 +1094,32 @@ public:
         out << "time_remaining=" << remaining << "\n";
         out << "player_symbol=" << (isPlayer ? std::string(1, playerSymbol) : "NONE") << "\n";
         out << "player_name=" << playerName << "\n";
-        out << "status=" << statusTextLocked(isPlayer, alive, playerSymbol, playerName, remaining) << "\n";
+        out << "status=" << statusTextLocked(socket) << "\n";
         out << "GRID\n";
-        out << renderGridForClientLocked(socket, now);
+        for (const std::string &row : renderedRows)
+            out << row << "\n";
         out << "END\n";
         return out.str();
     }
-
-    std::string buildReplicaSnapshot()
-    {
-        std::lock_guard<std::mutex> lock(mtx);
-        std::string out;
-        for (int y = 0; y < HEIGHT; y++)
-        {
-            for (int x = 0; x < WIDTH; x++)
-                out.push_back(grid[y][x]);
-            out.push_back('\n');
-        }
-        out += "END\n";
-        return out;
-    }
-
-    bool applyReplicaSnapshot(const std::string &snapshot)
-    {
-        std::vector<std::string> rows;
-        rows.reserve(HEIGHT);
-
-        std::string current;
-        for (char c : snapshot)
-        {
-            if (c == '\r')
-                continue;
-
-            if (c == '\n')
-            {
-                rows.push_back(current);
-                current.clear();
-                continue;
-            }
-
-            current.push_back(c);
-        }
-
-        if (!current.empty())
-            rows.push_back(current);
-
-        if (rows.size() != HEIGHT)
-            return false;
-
-        for (const std::string &row : rows)
-        {
-            if (row.size() != WIDTH)
-                return false;
-        }
-
-        std::lock_guard<std::mutex> lock(mtx);
-        for (int y = 0; y < HEIGHT; y++)
-        {
-            for (int x = 0; x < WIDTH; x++)
-                grid[y][x] = rows[y][x];
-        }
-
-        return true;
-    }
 };
 
-int connectToHost(const std::string &host, int port)
+void sendToPrimary(const std::string &message)
 {
-    addrinfo hints{};
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
+    std::lock_guard<std::mutex> lock(primarySocketMtx);
+    if (primarySocket < 0)
+        return;
 
-    addrinfo *results = nullptr;
-    std::string portText = std::to_string(port);
-    int rc = getaddrinfo(host.c_str(), portText.c_str(), &hints, &results);
-    if (rc != 0)
+    if (send(primarySocket, message.c_str(), message.size(), 0) <= 0)
     {
-        std::cerr << "getaddrinfo failed for " << host << ":" << port
-                  << " (" << gai_strerror(rc) << ")\n";
-        return -1;
+        close(primarySocket);
+        primarySocket = -1;
     }
-
-    int sock = -1;
-    for (addrinfo *candidate = results; candidate != nullptr; candidate = candidate->ai_next)
-    {
-        sock = socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
-        if (sock < 0)
-            continue;
-
-        if (connect(sock, candidate->ai_addr, candidate->ai_addrlen) == 0)
-            break;
-
-        close(sock);
-        sock = -1;
-    }
-
-    freeaddrinfo(results);
-    return sock;
 }
 
 void connectToPrimary(const std::string &primaryHost, int primaryPort)
 {
-    std::cout << "Connecting to Primary at " << primaryHost << ":" << primaryPort << "...\n";
-
-    primarySocket = connectToHost(primaryHost, primaryPort);
+    std::cout << "Connecting to primary at " << primaryHost << ":" << primaryPort << "...\n";
+    primarySocket = connectToHostWithTimeout(primaryHost, primaryPort, 1500);
     if (primarySocket < 0)
     {
         std::cerr << "Unable to connect to primary " << primaryHost << ":" << primaryPort << "\n";
@@ -679,91 +1135,74 @@ void connectToPrimary(const std::string &primaryHost, int primaryPort)
         std::exit(1);
     }
 
-    std::cout << "Successfully connected to Primary\n";
-}
-
-void broadcastToReplicas(const std::string &msg)
-{
-    std::lock_guard<std::mutex> lock(replica_mtx);
-    
-    if (replicaSocket < 0) return;
-
-    if (send(replicaSocket, msg.c_str(), msg.size(), 0) <= 0)
-    {
-        close(replicaSocket);
-        replicaSocket = -1;
-        replicaConnected = false;
-        replica_cv.notify_all();
-    }
+    std::cout << "Successfully connected to primary\n";
 }
 
 void removeClientSocket(int socket)
 {
-    std::lock_guard<std::mutex> lock(client_mtx);
+    std::lock_guard<std::mutex> lock(clientMtx);
     auto it = std::remove(clients.begin(), clients.end(), socket);
     clients.erase(it, clients.end());
 }
 
-void sendFramesToClients(TronGame &game)
+void sendFramesToClients(ReplicaNode &node)
 {
     std::vector<int> sockets;
     {
-        std::lock_guard<std::mutex> lock(client_mtx);
+        std::lock_guard<std::mutex> lock(clientMtx);
         sockets = clients;
     }
 
     for (int socket : sockets)
     {
-        std::string frame = game.buildFrameForClient(socket);
+        std::string frame = node.buildFrameForClient(socket);
         if (send(socket, frame.c_str(), frame.size(), 0) <= 0)
         {
-            game.removeConnection(socket);
+            node.removeConnection(socket);
             removeClientSocket(socket);
         }
     }
 }
 
-void clientHandler(TronGame &game, int socket)
+void clientHandler(ReplicaNode &node, int socket)
 {
+    std::string pending;
     char buffer[1024];
 
-    while (true)
+    while (runReplica.load())
     {
         int bytes = recv(socket, buffer, sizeof(buffer), MSG_DONTWAIT);
         if (bytes > 0)
         {
-            std::string input(buffer, bytes);
-            std::string commandInput = input;
-            size_t namePos = input.find("NAME:");
-            if (namePos != std::string::npos)
-            {
-                size_t valueStart = namePos + 5;
-                size_t valueEnd = input.find_first_of("\r\n", valueStart);
-                std::string requestedName = input.substr(
-                    valueStart,
-                    valueEnd == std::string::npos ? std::string::npos : valueEnd - valueStart);
-                game.setPlayerName(socket, requestedName);
+            pending.append(buffer, bytes);
 
-                if (valueEnd == std::string::npos)
+            size_t newline = std::string::npos;
+            while ((newline = pending.find('\n')) != std::string::npos)
+            {
+                std::string line = pending.substr(0, newline);
+                pending.erase(0, newline + 1);
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+
+                if (line.empty() || line == "CLIENT")
+                    continue;
+
+                std::string clientId;
+                std::string playerName;
+                if (parseHelloLine(line, clientId, playerName))
                 {
-                    commandInput.erase(namePos);
+                    node.setViewerIdentity(socket, clientId, playerName);
+                    sendFramesToClients(node);
+                    continue;
                 }
-                else
+
+                ReplicatedInput input;
+                if (parseInputLine(line, input))
                 {
-                    commandInput.erase(namePos, (valueEnd - namePos) + 1);
+                    node.queueMirroredInput(socket, input);
+                    continue;
                 }
             }
-
-            if (commandInput.find("START") != std::string::npos)
-                game.requestStart(socket);
-            else if (commandInput.find("UP") != std::string::npos)
-                game.changeDirection(socket, "UP");
-            else if (commandInput.find("DOWN") != std::string::npos)
-                game.changeDirection(socket, "DOWN");
-            else if (commandInput.find("LEFT") != std::string::npos)
-                game.changeDirection(socket, "LEFT");
-            else if (commandInput.find("RIGHT") != std::string::npos)
-                game.changeDirection(socket, "RIGHT");
         }
         else if (bytes == 0)
         {
@@ -774,45 +1213,114 @@ void clientHandler(TronGame &game, int socket)
             break;
         }
 
-        std::memset(buffer, 0, sizeof(buffer));
-        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
 
-    game.removeConnection(socket);
+    node.removeConnection(socket);
     removeClientSocket(socket);
 }
 
-void gameLoop(TronGame &game)
+bool consumePrimaryMessage(std::string &buffer, std::string &messageType, std::string &rawMessage)
 {
-    while (isPrimary)
+    while (!buffer.empty())
     {
-        game.update();
-        sendFramesToClients(game);
-        broadcastToReplicas(game.buildReplicaSnapshot());
-        std::this_thread::sleep_for(std::chrono::milliseconds(kServerTickMs));
+        if (buffer.rfind("REPLICA\n", 0) == 0)
+        {
+            buffer.erase(0, 8);
+            continue;
+        }
+
+        if (buffer.rfind("\n", 0) == 0 || buffer.rfind("\r", 0) == 0)
+        {
+            buffer.erase(0, 1);
+            continue;
+        }
+
+        struct Candidate
+        {
+            const char *prefix;
+            const char *terminator;
+            const char *type;
+        };
+
+        static const Candidate candidates[] = {
+            {"HEARTBEAT\n", "END_HEARTBEAT\n", "HEARTBEAT"},
+            {"TICK_SEAL\n", "END_TICK_SEAL\n", "TICK_SEAL"},
+            {"CHECKPOINT\n", "END_CHECKPOINT\n", "CHECKPOINT"}};
+
+        for (const Candidate &candidate : candidates)
+        {
+            if (buffer.rfind(candidate.prefix, 0) != 0)
+                continue;
+
+            size_t endPos = buffer.find(candidate.terminator);
+            if (endPos == std::string::npos)
+                return false;
+
+            rawMessage = buffer.substr(0, endPos + std::strlen(candidate.terminator));
+            buffer.erase(0, endPos + std::strlen(candidate.terminator));
+            messageType = candidate.type;
+            return true;
+        }
+
+        size_t newline = buffer.find('\n');
+        if (newline == std::string::npos)
+            return false;
+        buffer.erase(0, newline + 1);
     }
+
+    return false;
 }
 
-void primarySyncLoop(TronGame &game)
+void primarySyncLoop(ReplicaNode &node)
 {
     std::string buffer;
     char recvBuffer[4096];
 
-    while (true)
+    while (runReplica.load() && !node.isAuthoritative())
     {
         int bytes = recv(primarySocket, recvBuffer, sizeof(recvBuffer), 0);
         if (bytes > 0)
         {
             buffer.append(recvBuffer, bytes);
 
-            size_t endPos = std::string::npos;
-            while ((endPos = buffer.find("END\n")) != std::string::npos)
+            std::string type;
+            std::string raw;
+            while (consumePrimaryMessage(buffer, type, raw))
             {
-                std::string snapshot = buffer.substr(0, endPos);
-                buffer.erase(0, endPos + 4);
+                if (type == "HEARTBEAT")
+                {
+                    HeartbeatMessage heartbeat;
+                    if (parseHeartbeat(raw, heartbeat))
+                        node.applyHeartbeat(heartbeat);
+                    continue;
+                }
 
-                if (!game.applyReplicaSnapshot(snapshot))
-                    std::cerr << "Received invalid snapshot from primary.\n";
+                if (type == "CHECKPOINT")
+                {
+                    ReplicationCheckpoint checkpoint;
+                    if (parseCheckpoint(raw, checkpoint))
+                    {
+                        SafeTickReport report;
+                        if (node.applyCheckpoint(checkpoint, report))
+                            sendToPrimary(serializeSafeTickReport(report));
+                        sendFramesToClients(node);
+                    }
+                    continue;
+                }
+
+                if (type == "TICK_SEAL")
+                {
+                    TickSeal seal;
+                    if (parseTickSeal(raw, seal))
+                    {
+                        SafeTickReport report;
+                        if (node.applyTickSeal(seal, report))
+                            sendToPrimary(serializeSafeTickReport(report));
+                        sendFramesToClients(node);
+                    }
+                    continue;
+                }
             }
 
             continue;
@@ -824,12 +1332,118 @@ void primarySyncLoop(TronGame &game)
             break;
         }
 
-        std::perror("recv from primary");
-        break;
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+        {
+            std::perror("recv from primary");
+            break;
+        }
     }
 
-    close(primarySocket);
-    primarySocket = -1;
+    std::lock_guard<std::mutex> lock(primarySocketMtx);
+    if (primarySocket >= 0)
+    {
+        close(primarySocket);
+        primarySocket = -1;
+    }
+}
+
+void witnessMonitorLoop(ReplicaNode &node,
+                        const std::string &witnessHost,
+                        int witnessPort,
+                        const std::string &ownerId)
+{
+    int witnessFailures = 0;
+
+    while (runReplica.load())
+    {
+        if (node.isAuthoritative())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            continue;
+        }
+
+        WitnessReply pingReply = pingWitness(witnessHost, witnessPort);
+        if (!pingReply.reachable)
+        {
+            witnessFailures++;
+            if (witnessFailures >= 3)
+                node.setWitnessAvailable(false);
+        }
+        else
+        {
+            witnessFailures = 0;
+            node.setWitnessAvailable(true);
+        }
+
+        if (node.canPromote() && node.millisecondsSincePrimaryHeartbeat() > (3LL * kServerTickMs))
+        {
+            std::uint64_t requestedEpoch = node.nextPromotionEpoch();
+            WitnessReply acquireReply = acquireWitnessLease(witnessHost, witnessPort, ownerId, requestedEpoch);
+            if (acquireReply.reachable && acquireReply.granted && acquireReply.epoch >= requestedEpoch)
+            {
+                node.promoteToLeader(acquireReply.epoch);
+                {
+                    std::lock_guard<std::mutex> lock(primarySocketMtx);
+                    if (primarySocket >= 0)
+                    {
+                        close(primarySocket);
+                        primarySocket = -1;
+                    }
+                }
+                sendFramesToClients(node);
+            }
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(kServerTickMs));
+    }
+}
+
+void leaderLoop(ReplicaNode &node,
+                const std::string &witnessHost,
+                int witnessPort,
+                const std::string &ownerId)
+{
+    int missedRenewals = 0;
+
+    while (runReplica.load())
+    {
+        if (!node.isAuthoritative())
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            continue;
+        }
+
+        auto tickStart = std::chrono::steady_clock::now();
+
+        WitnessReply renewReply = renewWitnessLease(witnessHost, witnessPort, ownerId, node.getEpoch());
+        if (!renewReply.reachable)
+        {
+            missedRenewals++;
+            if (missedRenewals >= 3)
+                node.setWitnessAvailable(false);
+        }
+        else
+        {
+            missedRenewals = 0;
+            node.setWitnessAvailable(true);
+            if (!renewReply.granted && renewReply.epoch > node.getEpoch())
+            {
+                std::cerr << "Witness reports a newer leader epoch " << renewReply.epoch
+                          << ". Stopping promoted replica.\n";
+                runReplica = false;
+                break;
+            }
+        }
+
+        node.leaderTick();
+        sendFramesToClients(node);
+
+        auto elapsed = std::chrono::steady_clock::now() - tickStart;
+        auto sleepFor = std::chrono::milliseconds(kServerTickMs) -
+                        std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
+        if (sleepFor.count() > 0)
+            std::this_thread::sleep_for(sleepFor);
+    }
 }
 
 struct ServerStartupOptions
@@ -838,12 +1452,16 @@ struct ServerStartupOptions
     int primary_port = 0;
     std::string this_host;
     int this_port = 0;
+    std::string witness_host;
+    int witness_port = 0;
 };
 
 void printServerUsage(const char *programName)
 {
     std::cout << "Usage: " << programName
-              << " [--p_host <sunlab-host>] [--p_port 6000-6010] [--this_host <sunlab-host>] [--this_port 6000-6010]\n";
+              << " [--p_host <sunlab-host>] [--p_port 6000-6010]"
+              << " [--this_host <sunlab-host>] [--this_port 6000-6010]"
+              << " [--w_host <sunlab-host>] [--w_port 6000-6010]\n";
 }
 
 std::string localHostnameNormalized()
@@ -861,84 +1479,81 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
     {
         std::string arg = argv[i];
 
-        if (arg == "--p_host")
+        auto parseHostArg = [&](std::string &out) -> bool
         {
             if (i + 1 >= argc)
-            {
-                std::cerr << "--p_host requires a value.\n";
                 return false;
-            }
-
             std::string parsedHost = argv[++i];
-            if (!isValidSunlabHost(parsedHost))
+            if (!isValidConfiguredHost(parsedHost))
+                return false;
+            out = normalizeConfiguredHost(parsedHost);
+            return true;
+        };
+
+        auto parsePortArg = [&](int &out) -> bool
+        {
+            if (i + 1 >= argc)
+                return false;
+            return parsePortInRange(argv[++i], out);
+        };
+
+        if (arg == "--p_host")
+        {
+            if (!parseHostArg(options.primary_host))
             {
-                std::cerr << "Invalid host '" << parsedHost
-                          << "'. Host must be one of the Sunlab nodes.\n";
+                std::cerr << "Invalid --p_host value.\n";
                 return false;
             }
-
-            options.primary_host = normalizeSunlabHost(parsedHost);
             continue;
         }
 
         if (arg == "--p_port")
         {
-            if (i + 1 >= argc)
+            if (!parsePortArg(options.primary_port))
             {
-                std::cerr << "--p_port requires a value.\n";
+                std::cerr << "Invalid --p_port value.\n";
                 return false;
             }
-
-            int parsedPort = 0;
-            if (!parsePortInRange(argv[++i], parsedPort))
-            {
-                std::cerr << "Invalid port. Use an integer in [" << kMinAllowedPort
-                          << "," << kMaxAllowedPort << "].\n";
-                return false;
-            }
-
-            options.primary_port = parsedPort;
             continue;
         }
 
         if (arg == "--this_host")
         {
-            if (i + 1 >= argc)
+            if (!parseHostArg(options.this_host))
             {
-                std::cerr << "--this_host requires a value.\n";
+                std::cerr << "Invalid --this_host value.\n";
                 return false;
             }
-
-            std::string parsedHost = argv[++i];
-            if (!isValidSunlabHost(parsedHost))
-            {
-                std::cerr << "Invalid host '" << parsedHost
-                          << "'. Host must be one of the Sunlab nodes.\n";
-                return false;
-            }
-
-            std::string normalized = normalizeSunlabHost(parsedHost);
-            options.this_host = normalized;
             continue;
         }
 
         if (arg == "--this_port")
         {
-            if (i + 1 >= argc)
+            if (!parsePortArg(options.this_port))
             {
-                std::cerr << "--this_port requires a value.\n";
+                std::cerr << "Invalid --this_port value.\n";
                 return false;
             }
+            continue;
+        }
 
-            int parsedPort = 0;
-            if (!parsePortInRange(argv[++i], parsedPort))
+        if (arg == "--w_host")
+        {
+            if (!parseHostArg(options.witness_host))
             {
-                std::cerr << "Invalid port. Use an integer in [" << kMinAllowedPort
-                          << "," << kMaxAllowedPort << "].\n";
+                std::cerr << "Invalid --w_host value.\n";
                 return false;
             }
+            continue;
+        }
 
-            options.this_port = parsedPort;
+        if (arg == "--w_port")
+        {
+            if (!parsePortArg(options.witness_port))
+            {
+                std::cerr << "Invalid --w_port value.\n";
+                return false;
+            }
             continue;
         }
 
@@ -978,11 +1593,18 @@ int main(int argc, char *argv[])
     }
     if (options.this_port == 0)
         options.this_port = promptForPort();
+    if (options.witness_host.empty())
+    {
+        std::cout << "Enter witness host:\n";
+        options.witness_host = promptForSunlabHost();
+    }
+    if (options.witness_port == 0)
+        options.witness_port = promptForPort();
 
     std::string localHost = localHostnameNormalized();
     if (!localHost.empty() && isValidSunlabHost(localHost) && localHost != options.this_host)
     {
-        std::cerr << "Selected host " << toSunlabFqdn(options.this_host)
+        std::cerr << "Selected host " << toConnectHost(options.this_host)
                   << " does not match this machine (" << toSunlabFqdn(localHost)
                   << "). SSH into the selected node before starting the server.\n";
         return 1;
@@ -1022,38 +1644,70 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    TronGame game;
-    std::cout << "REPLICA running on " << toSunlabFqdn(options.this_host) << " port " << options.this_port << "\n";
+    ReplicaNode node;
+    std::cout << "REPLICA running on " << toConnectHost(options.this_host) << " port " << options.this_port << "\n";
+    std::cout << "Witness on " << toConnectHost(options.witness_host) << ":" << options.witness_port << "\n";
 
-    connectToPrimary(toSunlabFqdn(options.primary_host), options.primary_port);
-    std::thread(primarySyncLoop, std::ref(game)).detach();
+    connectToPrimary(toConnectHost(options.primary_host), options.primary_port);
+    std::string ownerId = toConnectHost(options.this_host) + ":" + std::to_string(options.this_port);
+    std::thread(primarySyncLoop, std::ref(node)).detach();
+    std::thread(witnessMonitorLoop,
+                std::ref(node),
+                toConnectHost(options.witness_host),
+                options.witness_port,
+                ownerId)
+        .detach();
+    std::thread(leaderLoop,
+                std::ref(node),
+                toConnectHost(options.witness_host),
+                options.witness_port,
+                ownerId)
+        .detach();
 
-    while (true)
+    while (runReplica.load())
     {
+        fd_set readSet;
+        FD_ZERO(&readSet);
+        FD_SET(serverFd, &readSet);
+
+        timeval timeout{};
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;
+
+        int rc = select(serverFd + 1, &readSet, nullptr, nullptr, &timeout);
+        if (rc < 0)
+        {
+            if (errno == EINTR)
+                continue;
+            break;
+        }
+
+        if (rc == 0 || !FD_ISSET(serverFd, &readSet))
+            continue;
+
         int clientSocket = accept(serverFd, nullptr, nullptr);
         if (clientSocket < 0)
             continue;
 
         {
-            std::lock_guard<std::mutex> lock(client_mtx);
+            std::lock_guard<std::mutex> lock(clientMtx);
             clients.push_back(clientSocket);
         }
 
         std::string note;
-        game.registerConnection(clientSocket, note);
+        node.registerConnection(clientSocket, note);
         std::cout << "Client connected: " << note << "\n";
 
-        std::string frame = game.buildFrameForClient(clientSocket);
+        std::string frame = node.buildFrameForClient(clientSocket);
         if (send(clientSocket, frame.c_str(), frame.size(), 0) <= 0)
         {
-            game.removeConnection(clientSocket);
+            node.removeConnection(clientSocket);
             removeClientSocket(clientSocket);
             continue;
         }
 
-        std::thread(clientHandler, std::ref(game), clientSocket).detach();
+        std::thread(clientHandler, std::ref(node), clientSocket).detach();
     }
-
 
     close(serverFd);
     return 0;
