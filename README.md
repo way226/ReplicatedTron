@@ -135,7 +135,7 @@ Tick lateness workflow
 - The primary writes `logs/tick_lateness_primary.csv` by default.
 - The replica writes `logs/tick_lateness_replica.csv` by default, but only records samples after it actually promotes and becomes authoritative.
 - Each row stores `epoch`, `tick`, scheduled due time, actual publish time, tick runtime, and computed lateness in milliseconds.
-- By default we keep the first `1000` authoritative tick samples, which matches the suggested evaluation window. Use `--tick_log_limit 0` to keep all samples.
+- By default we keep the first `10000` authoritative tick samples, which matches the suggested evaluation window. Use `--tick_log_limit 0` to keep all samples.
 - Use `--tick_log off` if you want to disable the CSV for a run.
 - The plotting helper expects `matplotlib`; install it with `python3 -m pip install matplotlib` if needed.
 - Generate the graph with `python3 tools/plot_tick_lateness.py logs/tick_lateness_primary.csv`.

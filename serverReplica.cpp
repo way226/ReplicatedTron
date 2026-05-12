@@ -1482,7 +1482,7 @@ struct ServerStartupOptions
     std::string witness_host;
     int witness_port = 0;
     std::string tick_log_path = "logs/tick_lateness_replica.csv";
-    std::size_t tick_log_limit = 1000;
+    std::size_t tick_log_limit = 10000;
 };
 
 void printServerUsage(const char *programName)
