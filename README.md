@@ -10,8 +10,9 @@ How to run (interactive)
 5. If joining as a client, enter a player name for winner/status messages
 
 Direct run options
-1. Start a server with `./server [primary|replica] --host <node> --port <6000-6010>`
-2. Start a client with `./client --host <node> --port <6000-6010> [--name <player-name>]`
+1. Start the primary with `./serverPrimary --host <node> --port <6000-6010>`
+2. Start the replica with `./serverReplica --p_host <primary-node> --p_port <6000-6010> --this_host <replica-node> --this_port <6000-6010>`
+3. Start a client with `./client --host <node> --port <6000-6010> [--name <player-name>]`
 
 Gameplay flow
 1. Lobby waits for a manual start command from any connected client (`R` key).

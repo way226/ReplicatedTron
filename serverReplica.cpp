@@ -10,6 +10,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <netdb.h>
 #include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
@@ -579,32 +580,104 @@ public:
         out += "END\n";
         return out;
     }
+
+    bool applyReplicaSnapshot(const std::string &snapshot)
+    {
+        std::vector<std::string> rows;
+        rows.reserve(HEIGHT);
+
+        std::string current;
+        for (char c : snapshot)
+        {
+            if (c == '\r')
+                continue;
+
+            if (c == '\n')
+            {
+                rows.push_back(current);
+                current.clear();
+                continue;
+            }
+
+            current.push_back(c);
+        }
+
+        if (!current.empty())
+            rows.push_back(current);
+
+        if (rows.size() != HEIGHT)
+            return false;
+
+        for (const std::string &row : rows)
+        {
+            if (row.size() != WIDTH)
+                return false;
+        }
+
+        std::lock_guard<std::mutex> lock(mtx);
+        for (int y = 0; y < HEIGHT; y++)
+        {
+            for (int x = 0; x < WIDTH; x++)
+                grid[y][x] = rows[y][x];
+        }
+
+        return true;
+    }
 };
 
-void connectToPrimary(const std::string& primaryHost, int primaryPort)
+int connectToHost(const std::string &host, int port)
 {
-    primarySocket = socket(AF_INET, SOCK_STREAM, 0);
-    if (primarySocket < 0)
+    addrinfo hints{};
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+
+    addrinfo *results = nullptr;
+    std::string portText = std::to_string(port);
+    int rc = getaddrinfo(host.c_str(), portText.c_str(), &hints, &results);
+    if (rc != 0)
     {
-        perror("socket");
-        exit(1);
+        std::cerr << "getaddrinfo failed for " << host << ":" << port
+                  << " (" << gai_strerror(rc) << ")\n";
+        return -1;
     }
 
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(primaryPort);
-    addr.sin_addr.s_addr = inet_addr((primaryHost + ".cse.lehigh.edu").c_str());
+    int sock = -1;
+    for (addrinfo *candidate = results; candidate != nullptr; candidate = candidate->ai_next)
+    {
+        sock = socket(candidate->ai_family, candidate->ai_socktype, candidate->ai_protocol);
+        if (sock < 0)
+            continue;
 
+        if (connect(sock, candidate->ai_addr, candidate->ai_addrlen) == 0)
+            break;
+
+        close(sock);
+        sock = -1;
+    }
+
+    freeaddrinfo(results);
+    return sock;
+}
+
+void connectToPrimary(const std::string &primaryHost, int primaryPort)
+{
     std::cout << "Connecting to Primary at " << primaryHost << ":" << primaryPort << "...\n";
 
-    if (connect(primarySocket, (sockaddr*)&addr, sizeof(addr)) < 0)
+    primarySocket = connectToHost(primaryHost, primaryPort);
+    if (primarySocket < 0)
     {
-        perror("connect to primary failed");
-        exit(1);
+        std::cerr << "Unable to connect to primary " << primaryHost << ":" << primaryPort << "\n";
+        std::exit(1);
     }
 
-    const char* hello = "REPLICA\n";
-    send(primarySocket, hello, strlen(hello), 0);
+    const char *hello = "REPLICA\n";
+    if (send(primarySocket, hello, std::strlen(hello), 0) <= 0)
+    {
+        std::perror("send");
+        close(primarySocket);
+        primarySocket = -1;
+        std::exit(1);
+    }
 
     std::cout << "Successfully connected to Primary\n";
 }
@@ -720,6 +793,45 @@ void gameLoop(TronGame &game)
     }
 }
 
+void primarySyncLoop(TronGame &game)
+{
+    std::string buffer;
+    char recvBuffer[4096];
+
+    while (true)
+    {
+        int bytes = recv(primarySocket, recvBuffer, sizeof(recvBuffer), 0);
+        if (bytes > 0)
+        {
+            buffer.append(recvBuffer, bytes);
+
+            size_t endPos = std::string::npos;
+            while ((endPos = buffer.find("END\n")) != std::string::npos)
+            {
+                std::string snapshot = buffer.substr(0, endPos);
+                buffer.erase(0, endPos + 4);
+
+                if (!game.applyReplicaSnapshot(snapshot))
+                    std::cerr << "Received invalid snapshot from primary.\n";
+            }
+
+            continue;
+        }
+
+        if (bytes == 0)
+        {
+            std::cout << "Primary disconnected.\n";
+            break;
+        }
+
+        std::perror("recv from primary");
+        break;
+    }
+
+    close(primarySocket);
+    primarySocket = -1;
+}
+
 struct ServerStartupOptions
 {
     std::string primary_host;
@@ -731,7 +843,7 @@ struct ServerStartupOptions
 void printServerUsage(const char *programName)
 {
     std::cout << "Usage: " << programName
-              << " [primary|replica] [--p_host <sunlab-host>] [--p_port 6000-6010] [--this_host <this-host>] [--this_port <this-port>]\n";
+              << " [--p_host <sunlab-host>] [--p_port 6000-6010] [--this_host <sunlab-host>] [--this_port 6000-6010]\n";
 }
 
 std::string localHostnameNormalized()
@@ -852,8 +964,18 @@ int main(int argc, char *argv[])
         return 1;
     }
 
+    if (options.primary_host.empty())
+    {
+        std::cout << "Enter primary server config:\n";
+        options.primary_host = promptForSunlabHost();
+    }
+    if (options.primary_port == 0)
+        options.primary_port = promptForPort();
     if (options.this_host.empty())
+    {
+        std::cout << "Enter replica server config (this machine):\n";
         options.this_host = promptForSunlabHost();
+    }
     if (options.this_port == 0)
         options.this_port = promptForPort();
 
@@ -901,10 +1023,10 @@ int main(int argc, char *argv[])
     }
 
     TronGame game;
-    std::thread(gameLoop, std::ref(game)).detach();
     std::cout << "REPLICA running on " << toSunlabFqdn(options.this_host) << " port " << options.this_port << "\n";
 
     connectToPrimary(toSunlabFqdn(options.primary_host), options.primary_port);
+    std::thread(primarySyncLoop, std::ref(game)).detach();
 
     while (true)
     {

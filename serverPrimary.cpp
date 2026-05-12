@@ -76,6 +76,13 @@ std::string phaseToString(GamePhase phase)
     return "FINISHED";
 }
 
+enum class IncomingConnectionType
+{
+    Client,
+    Replica,
+    Unknown
+};
+
 int secondsRemaining(const std::chrono::steady_clock::time_point &endTime,
                      const std::chrono::steady_clock::time_point &now)
 {
@@ -601,6 +608,98 @@ void removeClientSocket(int socket)
     clients.erase(it, clients.end());
 }
 
+void clientHandler(TronGame &game, int socket);
+
+IncomingConnectionType classifyIncomingConnection(int socket)
+{
+    char buffer[64]{0};
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        int bytes = recv(socket, buffer, sizeof(buffer) - 1, MSG_PEEK | MSG_DONTWAIT);
+        if (bytes > 0)
+        {
+            std::string pending(buffer, bytes);
+            size_t lineEnd = pending.find_first_of("\r\n");
+            if (lineEnd == std::string::npos)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                continue;
+            }
+
+            std::string banner = pending.substr(0, lineEnd);
+            if (banner == "REPLICA")
+                return IncomingConnectionType::Replica;
+            if (banner == "CLIENT")
+                return IncomingConnectionType::Client;
+            return IncomingConnectionType::Unknown;
+        }
+
+        if (bytes == 0)
+            return IncomingConnectionType::Unknown;
+
+        if (errno != EAGAIN && errno != EWOULDBLOCK)
+            return IncomingConnectionType::Unknown;
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    return IncomingConnectionType::Unknown;
+}
+
+void startClientSession(TronGame &game, int clientSocket)
+{
+    {
+        std::lock_guard<std::mutex> lock(client_mtx);
+        clients.push_back(clientSocket);
+    }
+
+    std::string note;
+    game.registerConnection(clientSocket, note);
+    std::cout << "Client connected: " << note << "\n";
+
+    std::string frame = game.buildFrameForClient(clientSocket);
+    if (send(clientSocket, frame.c_str(), frame.size(), 0) <= 0)
+    {
+        game.removeConnection(clientSocket);
+        removeClientSocket(clientSocket);
+        return;
+    }
+
+    std::thread(clientHandler, std::ref(game), clientSocket).detach();
+}
+
+void handleIncomingConnection(TronGame &game, int socket)
+{
+    IncomingConnectionType kind = classifyIncomingConnection(socket);
+    if (kind == IncomingConnectionType::Replica)
+    {
+        std::lock_guard<std::mutex> lock(replica_mtx);
+        if (replicaSocket >= 0)
+        {
+            std::cout << "Replica already connected; rejecting extra replica connection.\n";
+            close(socket);
+            return;
+        }
+
+        replicaSocket = socket;
+        replicaConnected = true;
+        std::cout << "Replica connected\n";
+        replica_cv.notify_all();
+        return;
+    }
+
+    if (kind == IncomingConnectionType::Client)
+    {
+        startClientSession(game, socket);
+        return;
+    }
+
+    std::cout << "Rejected connection with missing or unknown startup banner.\n";
+    close(socket);
+}
+
 void sendFramesToClients(TronGame &game)
 {
     std::vector<int> sockets;
@@ -699,7 +798,7 @@ struct ServerStartupOptions
 void printServerUsage(const char *programName)
 {
     std::cout << "Usage: " << programName
-              << " [primary|replica] [--host <sunlab-host>] [--port 6000-6010]\n";
+              << " [--host <sunlab-host>] [--port 6000-6010]\n";
 }
 
 std::string localHostnameNormalized()
@@ -836,45 +935,10 @@ int main(int argc, char *argv[])
         while (!replicaConnected)
         {
             int clientSocket = accept(serverFd, nullptr, nullptr);
-            if (clientSocket < 0) continue;
+            if (clientSocket < 0)
+                continue;
 
-            char buf[64] = {0};
-            ssize_t bytes = recv(clientSocket, buf, sizeof(buf)-1, MSG_PEEK | MSG_DONTWAIT);
-
-            std::string firstMsg(buf, bytes > 0 ? bytes : 0);
-
-            if (firstMsg.find("REPLICA") != std::string::npos)
-            {
-                // This is the replica
-                {
-                    std::lock_guard<std::mutex> lock(replica_mtx);
-                    replicaSocket = clientSocket;
-                    replicaConnected = true;
-                }
-                std::cout << "Replica connected\n";
-                replica_cv.notify_all();
-            }
-            else
-            { // client has connected before replica
-                {
-                    std::lock_guard<std::mutex> lock(client_mtx);
-                    clients.push_back(clientSocket);
-                }
-
-                std::string note;
-                game.registerConnection(clientSocket, note);
-                std::cout << "Client connected: " << note << "\n";
-
-                std::string frame = game.buildFrameForClient(clientSocket);
-                if (send(clientSocket, frame.c_str(), frame.size(), 0) > 0)
-                {
-                    std::thread(clientHandler, std::ref(game), clientSocket).detach();
-                }
-                else
-                {
-                    close(clientSocket);
-                }
-            }
+            handleIncomingConnection(game, clientSocket);
         }
     }
 
@@ -884,24 +948,7 @@ int main(int argc, char *argv[])
         if (clientSocket < 0)
             continue;
 
-        {
-            std::lock_guard<std::mutex> lock(client_mtx);
-            clients.push_back(clientSocket);
-        }
-
-        std::string note;
-        game.registerConnection(clientSocket, note);
-        std::cout << "Client connected: " << note << "\n";
-
-        std::string frame = game.buildFrameForClient(clientSocket);
-        if (send(clientSocket, frame.c_str(), frame.size(), 0) <= 0)
-        {
-            game.removeConnection(clientSocket);
-            removeClientSocket(clientSocket);
-            continue;
-        }
-
-        std::thread(clientHandler, std::ref(game), clientSocket).detach();
+        handleIncomingConnection(game, clientSocket);
     }
 
 
