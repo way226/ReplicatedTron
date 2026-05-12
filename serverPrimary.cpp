@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <vector>
 #include <cerrno>
+#include <condition_variable>
 
 #include "sunlab_config.h"
 
@@ -30,8 +31,10 @@ constexpr int kMinimumPlayersToStart = 1;
 
 bool isPrimary = true;
 
-std::vector<int> replicas;
 std::mutex replica_mtx;
+std::condition_variable replica_cv;
+std::atomic<bool> replicaConnected{false};
+int replicaSocket = -1;
 
 std::vector<int> clients;
 std::mutex client_mtx;
@@ -579,18 +582,15 @@ public:
 void broadcastToReplicas(const std::string &msg)
 {
     std::lock_guard<std::mutex> lock(replica_mtx);
+    
+    if (replicaSocket < 0) return;
 
-    for (auto it = replicas.begin(); it != replicas.end();)
+    if (send(replicaSocket, msg.c_str(), msg.size(), 0) <= 0)
     {
-        if (send(*it, msg.c_str(), msg.size(), 0) <= 0)
-        {
-            close(*it);
-            it = replicas.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
+        close(replicaSocket);
+        replicaSocket = -1;
+        replicaConnected = false;
+        replica_cv.notify_all();
     }
 }
 
@@ -692,7 +692,6 @@ void gameLoop(TronGame &game)
 
 struct ServerStartupOptions
 {
-    bool primary = true;
     std::string host;
     int port = 0;
 };
@@ -717,18 +716,6 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
     for (int i = 1; i < argc; i++)
     {
         std::string arg = argv[i];
-
-        if (arg == "primary")
-        {
-            options.primary = true;
-            continue;
-        }
-
-        if (arg == "replica")
-        {
-            options.primary = false;
-            continue;
-        }
 
         if (arg == "--host")
         {
@@ -797,8 +784,6 @@ int main(int argc, char *argv[])
     if (options.port == 0)
         options.port = promptForPort();
 
-    isPrimary = options.primary;
-
     std::string localHost = localHostnameNormalized();
     if (!localHost.empty() && isValidSunlabHost(localHost) && localHost != options.host)
     {
@@ -842,55 +827,82 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::cout << (isPrimary ? "PRIMARY" : "REPLICA")
-              << " running on " << toSunlabFqdn(options.host)
-              << " port " << options.port << "\n";
-
     TronGame game;
+    std::thread(gameLoop, std::ref(game)).detach();
+    std::cout << "PRIMARY" << " running on " << toSunlabFqdn(options.host) << " port " << options.port << "\n";
 
-    if (isPrimary)
     {
-        std::thread(gameLoop, std::ref(game)).detach();
-
-        while (true)
+        while (!replicaConnected)
         {
             int clientSocket = accept(serverFd, nullptr, nullptr);
-            if (clientSocket < 0)
-                continue;
+            if (clientSocket < 0) continue;
 
+            char buf[64] = {0};
+            ssize_t bytes = recv(clientSocket, buf, sizeof(buf)-1, MSG_PEEK | MSG_DONTWAIT);
+
+            std::string firstMsg(buf, bytes > 0 ? bytes : 0);
+
+            if (firstMsg.find("REPLICA") != std::string::npos)
             {
-                std::lock_guard<std::mutex> lock(client_mtx);
-                clients.push_back(clientSocket);
-            }
-
-            std::string note;
-            game.registerConnection(clientSocket, note);
-            std::cout << "Client connected: " << note << "\n";
-
-            std::string frame = game.buildFrameForClient(clientSocket);
-            if (send(clientSocket, frame.c_str(), frame.size(), 0) <= 0)
-            {
-                game.removeConnection(clientSocket);
-                removeClientSocket(clientSocket);
-                continue;
-            }
-
-            std::thread(clientHandler, std::ref(game), clientSocket).detach();
-        }
-    }
-    else
-    {
-        while (true)
-        {
-            int replicaSocket = accept(serverFd, nullptr, nullptr);
-            if (replicaSocket >= 0)
-            {
-                std::lock_guard<std::mutex> lock(replica_mtx);
-                replicas.push_back(replicaSocket);
+                // This is the replica
+                {
+                    std::lock_guard<std::mutex> lock(replica_mtx);
+                    replicaSocket = clientSocket;
+                    replicaConnected = true;
+                }
                 std::cout << "Replica connected\n";
+                replica_cv.notify_all();
+            }
+            else
+            { // client has connected before replica
+                {
+                    std::lock_guard<std::mutex> lock(client_mtx);
+                    clients.push_back(clientSocket);
+                }
+
+                std::string note;
+                game.registerConnection(clientSocket, note);
+                std::cout << "Client connected: " << note << "\n";
+
+                std::string frame = game.buildFrameForClient(clientSocket);
+                if (send(clientSocket, frame.c_str(), frame.size(), 0) > 0)
+                {
+                    std::thread(clientHandler, std::ref(game), clientSocket).detach();
+                }
+                else
+                {
+                    close(clientSocket);
+                }
             }
         }
     }
+
+    while (true)
+    {
+        int clientSocket = accept(serverFd, nullptr, nullptr);
+        if (clientSocket < 0)
+            continue;
+
+        {
+            std::lock_guard<std::mutex> lock(client_mtx);
+            clients.push_back(clientSocket);
+        }
+
+        std::string note;
+        game.registerConnection(clientSocket, note);
+        std::cout << "Client connected: " << note << "\n";
+
+        std::string frame = game.buildFrameForClient(clientSocket);
+        if (send(clientSocket, frame.c_str(), frame.size(), 0) <= 0)
+        {
+            game.removeConnection(clientSocket);
+            removeClientSocket(clientSocket);
+            continue;
+        }
+
+        std::thread(clientHandler, std::ref(game), clientSocket).detach();
+    }
+
 
     close(serverFd);
     return 0;
