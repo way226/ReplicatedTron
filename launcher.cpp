@@ -56,7 +56,10 @@ int main()
     }
     else if (mode == LaunchMode::StartServerReplica)
     {
-        args = {"./serverReplica", "--host", host, "--port", std::to_string(port)};
+        std::cout << "Enter replica server config (this machine):\n";
+        std::string this_host = promptForSunlabHost();
+        int this_port = promptForPort();
+        args = {"./serverReplica", "--p_host", host, "--p_port", std::to_string(port), "--this_host", this_host, "--this_port", std::to_string(this_port)};
     }
     else if (mode == LaunchMode::ConnectClient)
     {

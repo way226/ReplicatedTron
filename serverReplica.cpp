@@ -17,6 +17,7 @@
 #include <unordered_set>
 #include <vector>
 #include <cerrno>
+#include <condition_variable>
 
 #include "sunlab_config.h"
 
@@ -30,8 +31,10 @@ constexpr int kMinimumPlayersToStart = 1;
 
 bool isPrimary = true;
 
-std::vector<int> replicas;
 std::mutex replica_mtx;
+std::condition_variable replica_cv;
+std::atomic<bool> replicaConnected{false};
+int replicaSocket = -1;
 
 std::vector<int> clients;
 std::mutex client_mtx;
@@ -39,6 +42,8 @@ std::mutex client_mtx;
 std::mt19937 rng{std::random_device{}()};
 std::uniform_int_distribution<int> distX(1, WIDTH - 2);
 std::uniform_int_distribution<int> distY(1, HEIGHT - 2);
+
+int primarySocket = -1;
 
 struct Player
 {
@@ -576,21 +581,46 @@ public:
     }
 };
 
+void connectToPrimary(const std::string& primaryHost, int primaryPort)
+{
+    primarySocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (primarySocket < 0)
+    {
+        perror("socket");
+        exit(1);
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(primaryPort);
+    addr.sin_addr.s_addr = inet_addr((primaryHost + ".cse.lehigh.edu").c_str());
+
+    std::cout << "Connecting to Primary at " << primaryHost << ":" << primaryPort << "...\n";
+
+    if (connect(primarySocket, (sockaddr*)&addr, sizeof(addr)) < 0)
+    {
+        perror("connect to primary failed");
+        exit(1);
+    }
+
+    const char* hello = "REPLICA\n";
+    send(primarySocket, hello, strlen(hello), 0);
+
+    std::cout << "Successfully connected to Primary\n";
+}
+
 void broadcastToReplicas(const std::string &msg)
 {
     std::lock_guard<std::mutex> lock(replica_mtx);
+    
+    if (replicaSocket < 0) return;
 
-    for (auto it = replicas.begin(); it != replicas.end();)
+    if (send(replicaSocket, msg.c_str(), msg.size(), 0) <= 0)
     {
-        if (send(*it, msg.c_str(), msg.size(), 0) <= 0)
-        {
-            close(*it);
-            it = replicas.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
+        close(replicaSocket);
+        replicaSocket = -1;
+        replicaConnected = false;
+        replica_cv.notify_all();
     }
 }
 
@@ -692,15 +722,16 @@ void gameLoop(TronGame &game)
 
 struct ServerStartupOptions
 {
-    bool primary = true;
-    std::string host;
-    int port = 0;
+    std::string primary_host;
+    int primary_port = 0;
+    std::string this_host;
+    int this_port = 0;
 };
 
 void printServerUsage(const char *programName)
 {
     std::cout << "Usage: " << programName
-              << " [primary|replica] [--host <sunlab-host>] [--port 6000-6010]\n";
+              << " [primary|replica] [--p_host <sunlab-host>] [--p_port 6000-6010] [--this_host <this-host>] [--this_port <this-port>]\n";
 }
 
 std::string localHostnameNormalized()
@@ -718,23 +749,11 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
     {
         std::string arg = argv[i];
 
-        if (arg == "primary")
-        {
-            options.primary = true;
-            continue;
-        }
-
-        if (arg == "replica")
-        {
-            options.primary = false;
-            continue;
-        }
-
-        if (arg == "--host")
+        if (arg == "--p_host")
         {
             if (i + 1 >= argc)
             {
-                std::cerr << "--host requires a value.\n";
+                std::cerr << "--p_host requires a value.\n";
                 return false;
             }
 
@@ -746,15 +765,15 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
                 return false;
             }
 
-            options.host = normalizeSunlabHost(parsedHost);
+            options.primary_host = normalizeSunlabHost(parsedHost);
             continue;
         }
 
-        if (arg == "--port")
+        if (arg == "--p_port")
         {
             if (i + 1 >= argc)
             {
-                std::cerr << "--port requires a value.\n";
+                std::cerr << "--p_port requires a value.\n";
                 return false;
             }
 
@@ -766,7 +785,48 @@ bool parseServerArgs(int argc, char *argv[], ServerStartupOptions &options)
                 return false;
             }
 
-            options.port = parsedPort;
+            options.primary_port = parsedPort;
+            continue;
+        }
+
+        if (arg == "--this_host")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "--this_host requires a value.\n";
+                return false;
+            }
+
+            std::string parsedHost = argv[++i];
+            if (!isValidSunlabHost(parsedHost))
+            {
+                std::cerr << "Invalid host '" << parsedHost
+                          << "'. Host must be one of the Sunlab nodes.\n";
+                return false;
+            }
+
+            std::string normalized = normalizeSunlabHost(parsedHost);
+            options.this_host = normalized;
+            continue;
+        }
+
+        if (arg == "--this_port")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "--this_port requires a value.\n";
+                return false;
+            }
+
+            int parsedPort = 0;
+            if (!parsePortInRange(argv[++i], parsedPort))
+            {
+                std::cerr << "Invalid port. Use an integer in [" << kMinAllowedPort
+                          << "," << kMaxAllowedPort << "].\n";
+                return false;
+            }
+
+            options.this_port = parsedPort;
             continue;
         }
 
@@ -792,17 +852,15 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    if (options.host.empty())
-        options.host = promptForSunlabHost();
-    if (options.port == 0)
-        options.port = promptForPort();
-
-    isPrimary = options.primary;
+    if (options.this_host.empty())
+        options.this_host = promptForSunlabHost();
+    if (options.this_port == 0)
+        options.this_port = promptForPort();
 
     std::string localHost = localHostnameNormalized();
-    if (!localHost.empty() && isValidSunlabHost(localHost) && localHost != options.host)
+    if (!localHost.empty() && isValidSunlabHost(localHost) && localHost != options.this_host)
     {
-        std::cerr << "Selected host " << toSunlabFqdn(options.host)
+        std::cerr << "Selected host " << toSunlabFqdn(options.this_host)
                   << " does not match this machine (" << toSunlabFqdn(localHost)
                   << "). SSH into the selected node before starting the server.\n";
         return 1;
@@ -825,7 +883,7 @@ int main(int argc, char *argv[])
 
     sockaddr_in address{};
     address.sin_family = AF_INET;
-    address.sin_port = htons(options.port);
+    address.sin_port = htons(options.this_port);
     address.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(serverFd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0)
@@ -842,55 +900,38 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    std::cout << (isPrimary ? "PRIMARY" : "REPLICA")
-              << " running on " << toSunlabFqdn(options.host)
-              << " port " << options.port << "\n";
-
     TronGame game;
+    std::thread(gameLoop, std::ref(game)).detach();
+    std::cout << "REPLICA running on " << toSunlabFqdn(options.this_host) << " port " << options.this_port << "\n";
 
-    if (isPrimary)
+    connectToPrimary(toSunlabFqdn(options.primary_host), options.primary_port);
+
+    while (true)
     {
-        std::thread(gameLoop, std::ref(game)).detach();
+        int clientSocket = accept(serverFd, nullptr, nullptr);
+        if (clientSocket < 0)
+            continue;
 
-        while (true)
         {
-            int clientSocket = accept(serverFd, nullptr, nullptr);
-            if (clientSocket < 0)
-                continue;
-
-            {
-                std::lock_guard<std::mutex> lock(client_mtx);
-                clients.push_back(clientSocket);
-            }
-
-            std::string note;
-            game.registerConnection(clientSocket, note);
-            std::cout << "Client connected: " << note << "\n";
-
-            std::string frame = game.buildFrameForClient(clientSocket);
-            if (send(clientSocket, frame.c_str(), frame.size(), 0) <= 0)
-            {
-                game.removeConnection(clientSocket);
-                removeClientSocket(clientSocket);
-                continue;
-            }
-
-            std::thread(clientHandler, std::ref(game), clientSocket).detach();
+            std::lock_guard<std::mutex> lock(client_mtx);
+            clients.push_back(clientSocket);
         }
-    }
-    else
-    {
-        while (true)
+
+        std::string note;
+        game.registerConnection(clientSocket, note);
+        std::cout << "Client connected: " << note << "\n";
+
+        std::string frame = game.buildFrameForClient(clientSocket);
+        if (send(clientSocket, frame.c_str(), frame.size(), 0) <= 0)
         {
-            int replicaSocket = accept(serverFd, nullptr, nullptr);
-            if (replicaSocket >= 0)
-            {
-                std::lock_guard<std::mutex> lock(replica_mtx);
-                replicas.push_back(replicaSocket);
-                std::cout << "Replica connected\n";
-            }
+            game.removeConnection(clientSocket);
+            removeClientSocket(clientSocket);
+            continue;
         }
+
+        std::thread(clientHandler, std::ref(game), clientSocket).detach();
     }
+
 
     close(serverFd);
     return 0;
