@@ -829,7 +829,8 @@ int main(int argc, char *argv[])
 
     TronGame game;
     std::thread(gameLoop, std::ref(game)).detach();
-    std::cout << "PRIMARY" << " running on " << toSunlabFqdn(options.host) << " port " << options.port << "\n";
+    std::cout << "PRIMARY running on " << toSunlabFqdn(options.host) << " port " << options.port << "\n";
+    std::cout << "Waiting for replica\n";
 
     {
         while (!replicaConnected)
