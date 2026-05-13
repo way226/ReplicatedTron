@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <iostream>
 #include <netdb.h>
 #include <sstream>
@@ -19,6 +20,8 @@
 
 #include "replication_protocol.h"
 #include "sunlab_config.h"
+
+constexpr int kServerTickMs = 150;
 
 const std::string playerUpRune = "\xE2\x87\xA1";
 const std::string playerLeftRune = "\xE2\x87\xA0";
@@ -318,6 +321,131 @@ struct ServerFrame
     std::string grid;
 };
 
+class AuthoritativeFrameTimingLogger
+{
+public:
+    using Clock = std::chrono::steady_clock;
+
+    AuthoritativeFrameTimingLogger(std::string path,
+                                   std::string observerId,
+                                   int tickIntervalMs,
+                                   std::size_t maxSamples)
+        : path_(std::move(path)),
+          observerId_(std::move(observerId)),
+          tickIntervalMs_(tickIntervalMs),
+          maxSamples_(maxSamples)
+    {
+        if (path_.empty() || path_ == "off")
+            return;
+
+        stream_.open(path_, std::ios::out | std::ios::trunc);
+        if (!stream_.is_open())
+        {
+            std::cerr << "Warning: unable to open client timing log at " << path_ << ".\n";
+            return;
+        }
+
+        stream_ << "sample_index,observer_id,source_label,epoch,tick,published_tick,safe_tick,"
+                   "due_at_ms,arrived_at_ms,interarrival_ms,tick_gap,epoch_changed,tick_lateness_ms\n";
+        stream_.flush();
+    }
+
+    bool enabled() const
+    {
+        return stream_.is_open();
+    }
+
+    const std::string &path() const
+    {
+        return path_;
+    }
+
+    std::size_t maxSamples() const
+    {
+        return maxSamples_;
+    }
+
+    void logFrame(const ServerFrame &frame,
+                  const std::string &sourceLabel,
+                  Clock::time_point arrivedAt)
+    {
+        std::lock_guard<std::mutex> lock(mtx_);
+        if (!enabled())
+            return;
+
+        if (maxSamples_ != 0 && samplesWritten_ >= maxSamples_)
+            return;
+
+        if (!scheduleActive_)
+        {
+            scheduleActive_ = true;
+            firstTick_ = frame.tick;
+            scheduleStart_ = arrivedAt;
+        }
+
+        if (frame.tick < firstTick_)
+            return;
+
+        const auto dueAt = scheduleStart_ +
+                           std::chrono::milliseconds(static_cast<long long>(frame.tick - firstTick_) * tickIntervalMs_);
+        const long long dueAtMs = relativeMilliseconds(dueAt);
+        const long long arrivedAtMs = relativeMilliseconds(arrivedAt);
+        const long long tickLatenessMs = arrivedAtMs > dueAtMs ? arrivedAtMs - dueAtMs : 0;
+
+        long long interarrivalMs = 0;
+        unsigned long long tickGap = 0;
+        int epochChanged = 0;
+        if (samplesWritten_ > 0)
+        {
+            interarrivalMs = std::chrono::duration_cast<std::chrono::milliseconds>(arrivedAt - previousArrivalAt_).count();
+            tickGap = frame.tick >= previousTick_ ? frame.tick - previousTick_ : 0;
+            epochChanged = frame.epoch != previousEpoch_ ? 1 : 0;
+        }
+
+        stream_ << (samplesWritten_ + 1) << ','
+                << observerId_ << ','
+                << sourceLabel << ','
+                << frame.epoch << ','
+                << frame.tick << ','
+                << frame.publishedTick << ','
+                << frame.safeTick << ','
+                << dueAtMs << ','
+                << arrivedAtMs << ','
+                << interarrivalMs << ','
+                << tickGap << ','
+                << epochChanged << ','
+                << tickLatenessMs << '\n';
+
+        samplesWritten_++;
+        previousArrivalAt_ = arrivedAt;
+        previousTick_ = frame.tick;
+        previousEpoch_ = frame.epoch;
+
+        if (samplesWritten_ % 25 == 0 || (maxSamples_ != 0 && samplesWritten_ == maxSamples_))
+            stream_.flush();
+    }
+
+private:
+    long long relativeMilliseconds(Clock::time_point timestamp) const
+    {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(timestamp - scheduleStart_).count();
+    }
+
+    std::string path_;
+    std::string observerId_;
+    int tickIntervalMs_ = 0;
+    std::size_t maxSamples_ = 0;
+    std::size_t samplesWritten_ = 0;
+    bool scheduleActive_ = false;
+    unsigned long long firstTick_ = 0;
+    unsigned long long previousTick_ = 0;
+    unsigned long long previousEpoch_ = 0;
+    Clock::time_point scheduleStart_{};
+    Clock::time_point previousArrivalAt_{};
+    std::ofstream stream_;
+    std::mutex mtx_;
+};
+
 void trimLineEnd(std::string &line)
 {
     if (!line.empty() && line.back() == '\r')
@@ -436,6 +564,8 @@ struct ClientStartupOptions
     std::string replicaHost;
     int replicaPort = 0;
     std::string name;
+    std::string timingLogPath = "logs/client_authoritative_timing.csv";
+    std::size_t timingLogLimit = 10000;
 };
 
 void printClientUsage(const char *programName)
@@ -443,7 +573,8 @@ void printClientUsage(const char *programName)
     std::cout << "Usage: " << programName
               << " [--host <sunlab-host>] [--port 6000-6010]"
               << " [--replica_host <sunlab-host>] [--replica_port 6000-6010]"
-              << " [--name <player-name>]\n";
+              << " [--name <player-name>]"
+              << " [--timing_log <path|off>] [--timing_log_limit <count>]\n";
 }
 
 bool parseClientArgs(int argc, char *argv[], ClientStartupOptions &options)
@@ -468,6 +599,30 @@ bool parseClientArgs(int argc, char *argv[], ClientStartupOptions &options)
             if (i + 1 >= argc)
                 return false;
             return parsePortInRange(argv[++i], out);
+        };
+
+        auto parseTimingLogLimitArg = [&](std::size_t &out) -> bool
+        {
+            if (i + 1 >= argc)
+                return false;
+
+            std::string value = trim(argv[++i]);
+            if (value.empty())
+                return false;
+
+            try
+            {
+                size_t consumed = 0;
+                unsigned long long parsed = std::stoull(value, &consumed, 10);
+                if (consumed != value.size())
+                    return false;
+                out = static_cast<std::size_t>(parsed);
+                return true;
+            }
+            catch (const std::exception &)
+            {
+                return false;
+            }
         };
 
         if (arg == "--host")
@@ -526,6 +681,28 @@ bool parseClientArgs(int argc, char *argv[], ClientStartupOptions &options)
             }
 
             options.name = parsedName;
+            continue;
+        }
+
+        if (arg == "--timing_log")
+        {
+            if (i + 1 >= argc)
+            {
+                std::cerr << "Invalid --timing_log value.\n";
+                return false;
+            }
+
+            options.timingLogPath = argv[++i];
+            continue;
+        }
+
+        if (arg == "--timing_log_limit")
+        {
+            if (!parseTimingLogLimitArg(options.timingLogLimit))
+            {
+                std::cerr << "Invalid --timing_log_limit value.\n";
+                return false;
+            }
             continue;
         }
 
@@ -685,6 +862,7 @@ bool sendHello(ConnectionTarget &target, const std::string &clientId, const std:
 
 void receiverLoop(ConnectionTarget &target,
                   SharedDisplayState &displayState,
+                  AuthoritativeFrameTimingLogger &timingLogger,
                   std::mutex &renderMtx,
                   std::unordered_map<char, PlayerRenderState> &playerStates,
                   std::vector<std::vector<std::string>> &frozenTrailRunes)
@@ -706,9 +884,12 @@ void receiverLoop(ConnectionTarget &target,
                 buffer.erase(0, pos + 4);
 
                 ServerFrame frame = parseFrame(rawFrame);
+                auto arrivedAt = AuthoritativeFrameTimingLogger::Clock::now();
                 RenderDecision decision = displayState.considerFrame(frame, target.label);
                 if (!decision.shouldRender)
                     continue;
+
+                timingLogger.logFrame(decision.frame, decision.sourceLabel, arrivedAt);
 
                 std::string rendered = renderGrid(decision.frame.grid, playerStates, frozenTrailRunes);
 
@@ -821,6 +1002,23 @@ int main(int argc, char *argv[])
     std::cout << "Player name: " << options.name << "\n";
     std::cout << "Client ID: " << clientId << "\n";
 
+    AuthoritativeFrameTimingLogger timingLogger(options.timingLogPath,
+                                                clientId,
+                                                kServerTickMs,
+                                                options.timingLogLimit);
+    if (timingLogger.enabled())
+    {
+        std::cout << "Client timing log: " << timingLogger.path();
+        if (timingLogger.maxSamples() == 0)
+            std::cout << " (all authoritative frames)\n";
+        else
+            std::cout << " (first " << timingLogger.maxSamples() << " authoritative frames)\n";
+    }
+    else
+    {
+        std::cout << "Client timing log: disabled\n";
+    }
+
     SharedDisplayState displayState;
     std::mutex renderMtx;
     std::unordered_map<char, PlayerRenderState> playerStates;
@@ -829,6 +1027,7 @@ int main(int argc, char *argv[])
     std::thread primaryThread(receiverLoop,
                               std::ref(primary),
                               std::ref(displayState),
+                              std::ref(timingLogger),
                               std::ref(renderMtx),
                               std::ref(playerStates),
                               std::ref(frozenTrailRunes));
@@ -839,6 +1038,7 @@ int main(int argc, char *argv[])
         replicaThread = std::thread(receiverLoop,
                                     std::ref(replica),
                                     std::ref(displayState),
+                                    std::ref(timingLogger),
                                     std::ref(renderMtx),
                                     std::ref(playerStates),
                                     std::ref(frozenTrailRunes));

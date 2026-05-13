@@ -12,7 +12,7 @@ How to run (interactive)
 Direct run options
 1. Start the primary with `./serverPrimary --host <node> --port <6000-6010> [--w_host <node>] [--w_port <6000-6010>] [--tick_log <path|off>] [--tick_log_limit <count>]`
 2. Start the replica with `./serverReplica --p_host <primary-node> --p_port <6000-6010> --this_host <replica-node> --this_port <6000-6010> [--w_host <node>] [--w_port <6000-6010>] [--tick_log <path|off>] [--tick_log_limit <count>]`
-3. Start a client with `./client --host <node> --port <6000-6010> [--name <player-name>]`
+3. Start a client with `./client --host <node> --port <6000-6010> [--name <player-name>] [--replica_host <node>] [--replica_port <6000-6010>] [--timing_log <path|off>] [--timing_log_limit <count>]`
 
 Gameplay flow
 1. Lobby waits for a manual start command from any connected client (`R` key).
@@ -140,6 +140,15 @@ Tick lateness workflow
 - The plotting helper expects `matplotlib`; install it with `python3 -m pip install matplotlib` if needed.
 - Generate the graph with `python3 tools/plot_tick_lateness.py logs/tick_lateness_primary.csv`.
 - To write to a specific image path, run `python3 tools/plot_tick_lateness.py logs/tick_lateness_primary.csv --output primary_lateness.png`.
+
+Client failover jitter workflow
+- To measure the visible pause during failover, use the client-side authoritative timing log rather than only the server-side publish log.
+- The client writes `logs/client_authoritative_timing.csv` by default.
+- This log keeps one continuous tick schedule across the primary and promoted replica, so the first authoritative tick after failover shows up late instead of resetting back to `0ms`.
+- Each row stores the authoritative `tick`, `epoch`, `source_label`, client arrival time, inter-arrival gap, epoch-change marker, and computed lateness.
+- By default we keep the first `10000` authoritative frames. Use `--timing_log_limit 0` to keep all samples.
+- When the replica takes over, the row where `epoch_changed=1` should line up with a spike in `tick_lateness_ms` and `interarrival_ms`.
+- Graph it with `python3 tools/plot_client_failover_timing.py logs/client_authoritative_timing.csv`.
 
 ## Remaining Replication Work
 
